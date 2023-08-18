@@ -13,25 +13,29 @@
  * later.  See the COPYING file in the top-level directory.
  *
  */
+
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "qemu-common.h"
 #include "qemu/cutils.h"
 #include "rdma.h"
 #include "migration.h"
 #include "qemu-file.h"
 #include "ram.h"
-#include "qemu-file-channel.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
+#include "qemu/module.h"
+#include "qemu/rcu.h"
 #include "qemu/sockets.h"
 #include "qemu/bitmap.h"
 #include "qemu/coroutine.h"
+#include "exec/memory.h"
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <rdma/rdma_cma.h>
 #include "trace.h"
+#include "qom/object.h"
+#include <poll.h>
 
 /*
  * Print and error on both the Monitor and the Log file.
@@ -269,7 +273,8 @@ static uint64_t htonll(uint64_t v)
     return u.llv;
 }
 
-static uint64_t ntohll(uint64_t v) {
+static uint64_t ntohll(uint64_t v)
+{
     union { uint32_t lv[2]; uint64_t llv; } u;
     u.llv = v;
     return ((uint64_t)ntohl(u.lv[0]) << 32) | (uint64_t) ntohl(u.lv[1]);
@@ -311,6 +316,7 @@ typedef struct RDMALocalBlocks {
 typedef struct RDMAContext {
     char *host;
     int port;
+    char *host_port;
 
     RDMAWorkRequestData wr_data[RDMA_WRID_MAX];
 
@@ -351,9 +357,11 @@ typedef struct RDMAContext {
     struct ibv_context          *verbs;
     struct rdma_event_channel   *channel;
     struct ibv_qp *qp;                      /* queue pair */
-    struct ibv_comp_channel *comp_channel;  /* completion channel */
+    struct ibv_comp_channel *recv_comp_channel;  /* recv completion channel */
+    struct ibv_comp_channel *send_comp_channel;  /* send completion channel */
     struct ibv_pd *pd;                      /* protection domain */
-    struct ibv_cq *cq;                      /* completion queue */
+    struct ibv_cq *recv_cq;                 /* recvieve completion queue */
+    struct ibv_cq *send_cq;                 /* send completion queue */
 
     /*
      * If a previous write failed (perhaps because of a failed
@@ -387,18 +395,21 @@ typedef struct RDMAContext {
     uint64_t unregistrations[RDMA_SIGNALED_SEND_MAX];
 
     GHashTable *blockmap;
+
+    /* the RDMAContext for return path */
+    struct RDMAContext *return_path;
+    bool is_return_path;
 } RDMAContext;
 
 #define TYPE_QIO_CHANNEL_RDMA "qio-channel-rdma"
-#define QIO_CHANNEL_RDMA(obj)                                     \
-    OBJECT_CHECK(QIOChannelRDMA, (obj), TYPE_QIO_CHANNEL_RDMA)
+OBJECT_DECLARE_SIMPLE_TYPE(QIOChannelRDMA, QIO_CHANNEL_RDMA)
 
-typedef struct QIOChannelRDMA QIOChannelRDMA;
 
 
 struct QIOChannelRDMA {
     QIOChannel parent;
-    RDMAContext *rdma;
+    RDMAContext *rdmain;
+    RDMAContext *rdmaout;
     QEMUFile *file;
     bool blocking; /* XXX we don't actually honour this yet */
 };
@@ -618,9 +629,12 @@ static int rdma_add_block(RDMAContext *rdma, const char *block_name,
  * in advanced before the migration starts. This tells us where the RAM blocks
  * are so that we can register them individually.
  */
-static int qemu_rdma_init_one_block(const char *block_name, void *host_addr,
-    ram_addr_t block_offset, ram_addr_t length, void *opaque)
+static int qemu_rdma_init_one_block(RAMBlock *rb, void *opaque)
 {
+    const char *block_name = qemu_ram_get_idstr(rb);
+    void *host_addr = qemu_ram_get_host_addr(rb);
+    ram_addr_t block_offset = qemu_ram_get_offset(rb);
+    ram_addr_t length = qemu_ram_get_used_length(rb);
     return rdma_add_block(opaque, block_name, host_addr, block_offset, length);
 }
 
@@ -632,10 +646,14 @@ static int qemu_rdma_init_one_block(const char *block_name, void *host_addr,
 static int qemu_rdma_init_ram_blocks(RDMAContext *rdma)
 {
     RDMALocalBlocks *local = &rdma->local_ram_blocks;
+    int ret;
 
     assert(rdma->blockmap == NULL);
     memset(local, 0, sizeof *local);
-    qemu_ram_foreach_migratable_block(qemu_rdma_init_one_block, rdma);
+    ret = foreach_not_ignored_block(qemu_rdma_init_one_block, rdma);
+    if (ret) {
+        return ret;
+    }
     trace_qemu_rdma_init_ram_blocks(local->nb_blocks);
     rdma->dest_blocks = g_new0(RDMADestBlock,
                                rdma->local_ram_blocks.nb_blocks);
@@ -825,10 +843,9 @@ static void qemu_rdma_dump_gid(const char *who, struct rdma_cm_id *id)
  */
 static int qemu_rdma_broken_ipv6_kernel(struct ibv_context *verbs, Error **errp)
 {
-    struct ibv_port_attr port_attr;
-
     /* This bug only exists in linux, to our knowledge. */
 #ifdef CONFIG_LINUX
+    struct ibv_port_attr port_attr;
 
     /*
      * Verbs are only NULL if management has bound to '[::]'.
@@ -841,7 +858,7 @@ static int qemu_rdma_broken_ipv6_kernel(struct ibv_context *verbs, Error **errp)
      */
     if (!verbs) {
         int num_devices, x;
-        struct ibv_device ** dev_list = ibv_get_device_list(&num_devices);
+        struct ibv_device **dev_list = ibv_get_device_list(&num_devices);
         bool roce_found = false;
         bool ib_found = false;
 
@@ -973,10 +990,12 @@ static int qemu_rdma_resolve_host(RDMAContext *rdma, Error **errp)
         }
     }
 
+    rdma_freeaddrinfo(res);
     ERROR(errp, "could not resolve address %s", rdma->host);
     goto err_resolve_get_addr;
 
 route:
+    rdma_freeaddrinfo(res);
     qemu_rdma_dump_gid("source_resolve_addr", rdma->cm_id);
 
     ret = rdma_get_cm_event(rdma->channel, &cm_event);
@@ -988,7 +1007,7 @@ route:
     if (cm_event->event != RDMA_CM_EVENT_ADDR_RESOLVED) {
         ERROR(errp, "result not equal to event_addr_resolved %s",
                 rdma_event_str(cm_event->event));
-        perror("rdma_resolve_addr");
+        error_report("rdma_resolve_addr");
         rdma_ack_cm_event(cm_event);
         ret = -EINVAL;
         goto err_resolve_get_addr;
@@ -1041,21 +1060,34 @@ static int qemu_rdma_alloc_pd_cq(RDMAContext *rdma)
         return -1;
     }
 
-    /* create completion channel */
-    rdma->comp_channel = ibv_create_comp_channel(rdma->verbs);
-    if (!rdma->comp_channel) {
-        error_report("failed to allocate completion channel");
+    /* create receive completion channel */
+    rdma->recv_comp_channel = ibv_create_comp_channel(rdma->verbs);
+    if (!rdma->recv_comp_channel) {
+        error_report("failed to allocate receive completion channel");
         goto err_alloc_pd_cq;
     }
 
     /*
-     * Completion queue can be filled by both read and write work requests,
-     * so must reflect the sum of both possible queue sizes.
+     * Completion queue can be filled by read work requests.
      */
-    rdma->cq = ibv_create_cq(rdma->verbs, (RDMA_SIGNALED_SEND_MAX * 3),
-            NULL, rdma->comp_channel, 0);
-    if (!rdma->cq) {
-        error_report("failed to allocate completion queue");
+    rdma->recv_cq = ibv_create_cq(rdma->verbs, (RDMA_SIGNALED_SEND_MAX * 3),
+                                  NULL, rdma->recv_comp_channel, 0);
+    if (!rdma->recv_cq) {
+        error_report("failed to allocate receive completion queue");
+        goto err_alloc_pd_cq;
+    }
+
+    /* create send completion channel */
+    rdma->send_comp_channel = ibv_create_comp_channel(rdma->verbs);
+    if (!rdma->send_comp_channel) {
+        error_report("failed to allocate send completion channel");
+        goto err_alloc_pd_cq;
+    }
+
+    rdma->send_cq = ibv_create_cq(rdma->verbs, (RDMA_SIGNALED_SEND_MAX * 3),
+                                  NULL, rdma->send_comp_channel, 0);
+    if (!rdma->send_cq) {
+        error_report("failed to allocate send completion queue");
         goto err_alloc_pd_cq;
     }
 
@@ -1065,11 +1097,19 @@ err_alloc_pd_cq:
     if (rdma->pd) {
         ibv_dealloc_pd(rdma->pd);
     }
-    if (rdma->comp_channel) {
-        ibv_destroy_comp_channel(rdma->comp_channel);
+    if (rdma->recv_comp_channel) {
+        ibv_destroy_comp_channel(rdma->recv_comp_channel);
+    }
+    if (rdma->send_comp_channel) {
+        ibv_destroy_comp_channel(rdma->send_comp_channel);
+    }
+    if (rdma->recv_cq) {
+        ibv_destroy_cq(rdma->recv_cq);
+        rdma->recv_cq = NULL;
     }
     rdma->pd = NULL;
-    rdma->comp_channel = NULL;
+    rdma->recv_comp_channel = NULL;
+    rdma->send_comp_channel = NULL;
     return -1;
 
 }
@@ -1086,8 +1126,8 @@ static int qemu_rdma_alloc_qp(RDMAContext *rdma)
     attr.cap.max_recv_wr = 3;
     attr.cap.max_send_sge = 1;
     attr.cap.max_recv_sge = 1;
-    attr.send_cq = rdma->cq;
-    attr.recv_cq = rdma->cq;
+    attr.send_cq = rdma->send_cq;
+    attr.recv_cq = rdma->recv_cq;
     attr.qp_type = IBV_QPT_RC;
 
     ret = rdma_create_qp(rdma->cm_id, rdma->pd, &attr);
@@ -1099,21 +1139,84 @@ static int qemu_rdma_alloc_qp(RDMAContext *rdma)
     return 0;
 }
 
+/* Check whether On-Demand Paging is supported by RDAM device */
+static bool rdma_support_odp(struct ibv_context *dev)
+{
+    struct ibv_device_attr_ex attr = {0};
+    int ret = ibv_query_device_ex(dev, NULL, &attr);
+    if (ret) {
+        return false;
+    }
+
+    if (attr.odp_caps.general_caps & IBV_ODP_SUPPORT) {
+        return true;
+    }
+
+    return false;
+}
+
+/*
+ * ibv_advise_mr to avoid RNR NAK error as far as possible.
+ * The responder mr registering with ODP will sent RNR NAK back to
+ * the requester in the face of the page fault.
+ */
+static void qemu_rdma_advise_prefetch_mr(struct ibv_pd *pd, uint64_t addr,
+                                         uint32_t len,  uint32_t lkey,
+                                         const char *name, bool wr)
+{
+#ifdef HAVE_IBV_ADVISE_MR
+    int ret;
+    int advice = wr ? IBV_ADVISE_MR_ADVICE_PREFETCH_WRITE :
+                 IBV_ADVISE_MR_ADVICE_PREFETCH;
+    struct ibv_sge sg_list = {.lkey = lkey, .addr = addr, .length = len};
+
+    ret = ibv_advise_mr(pd, advice,
+                        IBV_ADVISE_MR_FLAG_FLUSH, &sg_list, 1);
+    /* ignore the error */
+    if (ret) {
+        trace_qemu_rdma_advise_mr(name, len, addr, strerror(errno));
+    } else {
+        trace_qemu_rdma_advise_mr(name, len, addr, "successed");
+    }
+#endif
+}
+
 static int qemu_rdma_reg_whole_ram_blocks(RDMAContext *rdma)
 {
     int i;
     RDMALocalBlocks *local = &rdma->local_ram_blocks;
 
     for (i = 0; i < local->nb_blocks; i++) {
+        int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+
         local->block[i].mr =
             ibv_reg_mr(rdma->pd,
                     local->block[i].local_host_addr,
-                    local->block[i].length,
-                    IBV_ACCESS_LOCAL_WRITE |
-                    IBV_ACCESS_REMOTE_WRITE
+                    local->block[i].length, access
                     );
+
+        if (!local->block[i].mr &&
+            errno == ENOTSUP && rdma_support_odp(rdma->verbs)) {
+                access |= IBV_ACCESS_ON_DEMAND;
+                /* register ODP mr */
+                local->block[i].mr =
+                    ibv_reg_mr(rdma->pd,
+                               local->block[i].local_host_addr,
+                               local->block[i].length, access);
+                trace_qemu_rdma_register_odp_mr(local->block[i].block_name);
+
+                if (local->block[i].mr) {
+                    qemu_rdma_advise_prefetch_mr(rdma->pd,
+                                    (uintptr_t)local->block[i].local_host_addr,
+                                    local->block[i].length,
+                                    local->block[i].mr->lkey,
+                                    local->block[i].block_name,
+                                    true);
+                }
+        }
+
         if (!local->block[i].mr) {
-            perror("Failed to register local dest ram block!\n");
+            perror("Failed to register local dest ram block!");
             break;
         }
         rdma->total_registrations++;
@@ -1125,6 +1228,7 @@ static int qemu_rdma_reg_whole_ram_blocks(RDMAContext *rdma)
 
     for (i--; i >= 0; i--) {
         ibv_dereg_mr(local->block[i].mr);
+        local->block[i].mr = NULL;
         rdma->total_registrations--;
     }
 
@@ -1196,28 +1300,40 @@ static int qemu_rdma_register_and_get_keys(RDMAContext *rdma,
      */
     if (!block->pmr[chunk]) {
         uint64_t len = chunk_end - chunk_start;
+        int access = rkey ? IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE :
+                     0;
 
         trace_qemu_rdma_register_and_get_keys(len, chunk_start);
 
-        block->pmr[chunk] = ibv_reg_mr(rdma->pd,
-                chunk_start, len,
-                (rkey ? (IBV_ACCESS_LOCAL_WRITE |
-                        IBV_ACCESS_REMOTE_WRITE) : 0));
+        block->pmr[chunk] = ibv_reg_mr(rdma->pd, chunk_start, len, access);
+        if (!block->pmr[chunk] &&
+            errno == ENOTSUP && rdma_support_odp(rdma->verbs)) {
+            access |= IBV_ACCESS_ON_DEMAND;
+            /* register ODP mr */
+            block->pmr[chunk] = ibv_reg_mr(rdma->pd, chunk_start, len, access);
+            trace_qemu_rdma_register_odp_mr(block->block_name);
 
-        if (!block->pmr[chunk]) {
-            perror("Failed to register chunk!");
-            fprintf(stderr, "Chunk details: block: %d chunk index %d"
-                            " start %" PRIuPTR " end %" PRIuPTR
-                            " host %" PRIuPTR
-                            " local %" PRIuPTR " registrations: %d\n",
-                            block->index, chunk, (uintptr_t)chunk_start,
-                            (uintptr_t)chunk_end, host_addr,
-                            (uintptr_t)block->local_host_addr,
-                            rdma->total_registrations);
-            return -1;
+            if (block->pmr[chunk]) {
+                qemu_rdma_advise_prefetch_mr(rdma->pd, (uintptr_t)chunk_start,
+                                            len, block->pmr[chunk]->lkey,
+                                            block->block_name, rkey);
+
+            }
         }
-        rdma->total_registrations++;
     }
+    if (!block->pmr[chunk]) {
+        perror("Failed to register chunk!");
+        fprintf(stderr, "Chunk details: block: %d chunk index %d"
+                        " start %" PRIuPTR " end %" PRIuPTR
+                        " host %" PRIuPTR
+                        " local %" PRIuPTR " registrations: %d\n",
+                        block->index, chunk, (uintptr_t)chunk_start,
+                        (uintptr_t)chunk_end, host_addr,
+                        (uintptr_t)block->local_host_addr,
+                        rdma->total_registrations);
+        return -1;
+    }
+    rdma->total_registrations++;
 
     if (lkey) {
         *lkey = block->pmr[chunk]->lkey;
@@ -1252,30 +1368,6 @@ const char *print_wrid(int wrid)
     }
     return wrid_desc[wrid];
 }
-
-/*
- * RDMA requires memory registration (mlock/pinning), but this is not good for
- * overcommitment.
- *
- * In preparation for the future where LRU information or workload-specific
- * writable writable working set memory access behavior is available to QEMU
- * it would be nice to have in place the ability to UN-register/UN-pin
- * particular memory regions from the RDMA hardware when it is determine that
- * those regions of memory will likely not be accessed again in the near future.
- *
- * While we do not yet have such information right now, the following
- * compile-time option allows us to perform a non-optimized version of this
- * behavior.
- *
- * By uncommenting this option, you will cause *all* RDMA transfers to be
- * unregistered immediately after the transfer completes on both sides of the
- * connection. This has no effect in 'rdma-pin-all' mode, only regular mode.
- *
- * This will have a terrible impact on migration performance, so until future
- * workload information or LRU information is available, do not attempt to use
- * this feature except for basic testing.
- */
-//#define RDMA_UNREGISTRATION_EXAMPLE
 
 /*
  * Perform a non-optimized memory unregistration after every transfer
@@ -1370,46 +1462,18 @@ static uint64_t qemu_rdma_make_wrid(uint64_t wr_id, uint64_t index,
 }
 
 /*
- * Set bit for unregistration in the next iteration.
- * We cannot transmit right here, but will unpin later.
- */
-static void qemu_rdma_signal_unregister(RDMAContext *rdma, uint64_t index,
-                                        uint64_t chunk, uint64_t wr_id)
-{
-    if (rdma->unregistrations[rdma->unregister_next] != 0) {
-        error_report("rdma migration: queue is full");
-    } else {
-        RDMALocalBlock *block = &(rdma->local_ram_blocks.block[index]);
-
-        if (!test_and_set_bit(chunk, block->unregister_bitmap)) {
-            trace_qemu_rdma_signal_unregister_append(chunk,
-                                                     rdma->unregister_next);
-
-            rdma->unregistrations[rdma->unregister_next++] =
-                    qemu_rdma_make_wrid(wr_id, index, chunk);
-
-            if (rdma->unregister_next == RDMA_SIGNALED_SEND_MAX) {
-                rdma->unregister_next = 0;
-            }
-        } else {
-            trace_qemu_rdma_signal_unregister_already(chunk);
-        }
-    }
-}
-
-/*
  * Consult the connection manager to see a work request
  * (of any kind) has completed.
  * Return the work request ID that completed.
  */
-static uint64_t qemu_rdma_poll(RDMAContext *rdma, uint64_t *wr_id_out,
-                               uint32_t *byte_len)
+static uint64_t qemu_rdma_poll(RDMAContext *rdma, struct ibv_cq *cq,
+                               uint64_t *wr_id_out, uint32_t *byte_len)
 {
     int ret;
     struct ibv_wc wc;
     uint64_t wr_id;
 
-    ret = ibv_poll_cq(rdma->cq, 1, &wc);
+    ret = ibv_poll_cq(cq, 1, &wc);
 
     if (!ret) {
         *wr_id_out = RDMA_WRID_NONE;
@@ -1454,18 +1518,6 @@ static uint64_t qemu_rdma_poll(RDMAContext *rdma, uint64_t *wr_id_out,
         if (rdma->nb_sent > 0) {
             rdma->nb_sent--;
         }
-
-        if (!rdma->pin_all) {
-            /*
-             * FYI: If one wanted to signal a specific chunk to be unregistered
-             * using LRU or workload-specific information, this is the function
-             * you would call to do so. That chunk would then get asynchronously
-             * unregistered later.
-             */
-#ifdef RDMA_UNREGISTRATION_EXAMPLE
-            qemu_rdma_signal_unregister(rdma, index, chunk, wc.wr_id);
-#endif
-        }
     } else {
         trace_qemu_rdma_poll_other(print_wrid(wr_id), wr_id, rdma->nb_sent);
     }
@@ -1481,29 +1533,63 @@ static uint64_t qemu_rdma_poll(RDMAContext *rdma, uint64_t *wr_id_out,
 /* Wait for activity on the completion channel.
  * Returns 0 on success, none-0 on error.
  */
-static int qemu_rdma_wait_comp_channel(RDMAContext *rdma)
+static int qemu_rdma_wait_comp_channel(RDMAContext *rdma,
+                                       struct ibv_comp_channel *comp_channel)
 {
+    struct rdma_cm_event *cm_event;
+    int ret = -1;
+
     /*
      * Coroutine doesn't start until migration_fd_process_incoming()
      * so don't yield unless we know we're running inside of a coroutine.
      */
-    if (rdma->migration_started_on_destination) {
-        yield_until_fd_readable(rdma->comp_channel->fd);
+    if (rdma->migration_started_on_destination &&
+        migration_incoming_get_current()->state == MIGRATION_STATUS_ACTIVE) {
+        yield_until_fd_readable(comp_channel->fd);
     } else {
         /* This is the source side, we're in a separate thread
          * or destination prior to migration_fd_process_incoming()
+         * after postcopy, the destination also in a separate thread.
          * we can't yield; so we have to poll the fd.
          * But we need to be able to handle 'cancel' or an error
          * without hanging forever.
          */
         while (!rdma->error_state  && !rdma->received_error) {
-            GPollFD pfds[1];
-            pfds[0].fd = rdma->comp_channel->fd;
+            GPollFD pfds[2];
+            pfds[0].fd = comp_channel->fd;
             pfds[0].events = G_IO_IN | G_IO_HUP | G_IO_ERR;
+            pfds[0].revents = 0;
+
+            pfds[1].fd = rdma->channel->fd;
+            pfds[1].events = G_IO_IN | G_IO_HUP | G_IO_ERR;
+            pfds[1].revents = 0;
+
             /* 0.1s timeout, should be fine for a 'cancel' */
-            switch (qemu_poll_ns(pfds, 1, 100 * 1000 * 1000)) {
+            switch (qemu_poll_ns(pfds, 2, 100 * 1000 * 1000)) {
+            case 2:
             case 1: /* fd active */
-                return 0;
+                if (pfds[0].revents) {
+                    return 0;
+                }
+
+                if (pfds[1].revents) {
+                    ret = rdma_get_cm_event(rdma->channel, &cm_event);
+                    if (ret) {
+                        error_report("failed to get cm event while wait "
+                                     "completion channel");
+                        return -EPIPE;
+                    }
+
+                    error_report("receive cm event while wait comp channel,"
+                                 "cm event is %d", cm_event->event);
+                    if (cm_event->event == RDMA_CM_EVENT_DISCONNECTED ||
+                        cm_event->event == RDMA_CM_EVENT_DEVICE_REMOVAL) {
+                        rdma_ack_cm_event(cm_event);
+                        return -EPIPE;
+                    }
+                    rdma_ack_cm_event(cm_event);
+                }
+                break;
 
             case 0: /* Timeout, go around again */
                 break;
@@ -1528,6 +1614,17 @@ static int qemu_rdma_wait_comp_channel(RDMAContext *rdma)
     return rdma->error_state;
 }
 
+static struct ibv_comp_channel *to_channel(RDMAContext *rdma, int wrid)
+{
+    return wrid < RDMA_WRID_RECV_CONTROL ? rdma->send_comp_channel :
+           rdma->recv_comp_channel;
+}
+
+static struct ibv_cq *to_cq(RDMAContext *rdma, int wrid)
+{
+    return wrid < RDMA_WRID_RECV_CONTROL ? rdma->send_cq : rdma->recv_cq;
+}
+
 /*
  * Block until the next work request has completed.
  *
@@ -1548,13 +1645,15 @@ static int qemu_rdma_block_for_wrid(RDMAContext *rdma, int wrid_requested,
     struct ibv_cq *cq;
     void *cq_ctx;
     uint64_t wr_id = RDMA_WRID_NONE, wr_id_in;
+    struct ibv_comp_channel *ch = to_channel(rdma, wrid_requested);
+    struct ibv_cq *poll_cq = to_cq(rdma, wrid_requested);
 
-    if (ibv_req_notify_cq(rdma->cq, 0)) {
+    if (ibv_req_notify_cq(poll_cq, 0)) {
         return -1;
     }
     /* poll cq first */
     while (wr_id != wrid_requested) {
-        ret = qemu_rdma_poll(rdma, &wr_id_in, byte_len);
+        ret = qemu_rdma_poll(rdma, poll_cq, &wr_id_in, byte_len);
         if (ret < 0) {
             return ret;
         }
@@ -1575,12 +1674,12 @@ static int qemu_rdma_block_for_wrid(RDMAContext *rdma, int wrid_requested,
     }
 
     while (1) {
-        ret = qemu_rdma_wait_comp_channel(rdma);
+        ret = qemu_rdma_wait_comp_channel(rdma, ch);
         if (ret) {
             goto err_block_for_wrid;
         }
 
-        ret = ibv_get_cq_event(rdma->comp_channel, &cq, &cq_ctx);
+        ret = ibv_get_cq_event(ch, &cq, &cq_ctx);
         if (ret) {
             perror("ibv_get_cq_event");
             goto err_block_for_wrid;
@@ -1594,7 +1693,7 @@ static int qemu_rdma_block_for_wrid(RDMAContext *rdma, int wrid_requested,
         }
 
         while (wr_id != wrid_requested) {
-            ret = qemu_rdma_poll(rdma, &wr_id_in, byte_len);
+            ret = qemu_rdma_poll(rdma, poll_cq, &wr_id_in, byte_len);
             if (ret < 0) {
                 goto err_block_for_wrid;
             }
@@ -1973,11 +2072,6 @@ retry:
 
     chunk_end = ram_chunk_end(block, chunk + chunks);
 
-    if (!rdma->pin_all) {
-#ifdef RDMA_UNREGISTRATION_EXAMPLE
-        qemu_rdma_unregister_waiting(rdma);
-#endif
-    }
 
     while (test_bit(chunk, block->transit_bitmap)) {
         (void)count;
@@ -2224,7 +2318,7 @@ static inline int qemu_rdma_buffer_mergable(RDMAContext *rdma,
  *    chunk, then start a new chunk and flush() the old chunk.
  * 3. To keep the hardware busy, we also group chunks into batches
  *    and only require that a batch gets acknowledged in the completion
- *    qeueue instead of each individual chunk.
+ *    queue instead of each individual chunk.
  */
 static int qemu_rdma_write(QEMUFile *f, RDMAContext *rdma,
                            uint64_t block_offset, uint64_t offset,
@@ -2286,6 +2380,9 @@ static void qemu_rdma_cleanup(RDMAContext *rdma)
         rdma->connected = false;
     }
 
+    if (rdma->channel) {
+        qemu_set_fd_handler(rdma->channel->fd, NULL, NULL, NULL);
+    }
     g_free(rdma->dest_blocks);
     rdma->dest_blocks = NULL;
 
@@ -2307,13 +2404,21 @@ static void qemu_rdma_cleanup(RDMAContext *rdma)
         rdma_destroy_qp(rdma->cm_id);
         rdma->qp = NULL;
     }
-    if (rdma->cq) {
-        ibv_destroy_cq(rdma->cq);
-        rdma->cq = NULL;
+    if (rdma->recv_cq) {
+        ibv_destroy_cq(rdma->recv_cq);
+        rdma->recv_cq = NULL;
     }
-    if (rdma->comp_channel) {
-        ibv_destroy_comp_channel(rdma->comp_channel);
-        rdma->comp_channel = NULL;
+    if (rdma->send_cq) {
+        ibv_destroy_cq(rdma->send_cq);
+        rdma->send_cq = NULL;
+    }
+    if (rdma->recv_comp_channel) {
+        ibv_destroy_comp_channel(rdma->recv_comp_channel);
+        rdma->recv_comp_channel = NULL;
+    }
+    if (rdma->send_comp_channel) {
+        ibv_destroy_comp_channel(rdma->send_comp_channel);
+        rdma->send_comp_channel = NULL;
     }
     if (rdma->pd) {
         ibv_dealloc_pd(rdma->pd);
@@ -2323,16 +2428,30 @@ static void qemu_rdma_cleanup(RDMAContext *rdma)
         rdma_destroy_id(rdma->cm_id);
         rdma->cm_id = NULL;
     }
+
+    /* the destination side, listen_id and channel is shared */
     if (rdma->listen_id) {
-        rdma_destroy_id(rdma->listen_id);
+        if (!rdma->is_return_path) {
+            rdma_destroy_id(rdma->listen_id);
+        }
         rdma->listen_id = NULL;
+
+        if (rdma->channel) {
+            if (!rdma->is_return_path) {
+                rdma_destroy_event_channel(rdma->channel);
+            }
+            rdma->channel = NULL;
+        }
     }
+
     if (rdma->channel) {
         rdma_destroy_event_channel(rdma->channel);
         rdma->channel = NULL;
     }
     g_free(rdma->host);
+    g_free(rdma->host_port);
     rdma->host = NULL;
+    rdma->host_port = NULL;
 }
 
 
@@ -2397,7 +2516,36 @@ err_rdma_source_init:
     return -1;
 }
 
-static int qemu_rdma_connect(RDMAContext *rdma, Error **errp)
+static int qemu_get_cm_event_timeout(RDMAContext *rdma,
+                                     struct rdma_cm_event **cm_event,
+                                     long msec, Error **errp)
+{
+    int ret;
+    struct pollfd poll_fd = {
+                                .fd = rdma->channel->fd,
+                                .events = POLLIN,
+                                .revents = 0
+                            };
+
+    do {
+        ret = poll(&poll_fd, 1, msec);
+    } while (ret < 0 && errno == EINTR);
+
+    if (ret == 0) {
+        ERROR(errp, "poll cm event timeout");
+        return -1;
+    } else if (ret < 0) {
+        ERROR(errp, "failed to poll cm event, errno=%i", errno);
+        return -1;
+    } else if (poll_fd.revents & POLLIN) {
+        return rdma_get_cm_event(rdma->channel, cm_event);
+    } else {
+        ERROR(errp, "no POLLIN event, revent=%x", poll_fd.revents);
+        return -1;
+    }
+}
+
+static int qemu_rdma_connect(RDMAContext *rdma, Error **errp, bool return_path)
 {
     RDMACapabilities cap = {
                                 .version = RDMA_CONTROL_VERSION_CURRENT,
@@ -2435,16 +2583,19 @@ static int qemu_rdma_connect(RDMAContext *rdma, Error **errp)
         goto err_rdma_source_connect;
     }
 
-    ret = rdma_get_cm_event(rdma->channel, &cm_event);
+    if (return_path) {
+        ret = qemu_get_cm_event_timeout(rdma, &cm_event, 5000, errp);
+    } else {
+        ret = rdma_get_cm_event(rdma->channel, &cm_event);
+    }
     if (ret) {
         perror("rdma_get_cm_event after rdma_connect");
         ERROR(errp, "connecting to destination!");
-        rdma_ack_cm_event(cm_event);
         goto err_rdma_source_connect;
     }
 
     if (cm_event->event != RDMA_CM_EVENT_ESTABLISHED) {
-        perror("rdma_get_cm_event != EVENT_ESTABLISHED after rdma_connect");
+        error_report("rdma_get_cm_event != EVENT_ESTABLISHED after rdma_connect");
         ERROR(errp, "connecting to destination!");
         rdma_ack_cm_event(cm_event);
         goto err_rdma_source_connect;
@@ -2484,6 +2635,7 @@ static int qemu_rdma_dest_init(RDMAContext *rdma, Error **errp)
     char ip[40] = "unknown";
     struct rdma_addrinfo *res, *e;
     char port_str[16];
+    int reuse = 1;
 
     for (idx = 0; idx < RDMA_WRID_MAX; idx++) {
         rdma->wr_data[idx].control_len = 0;
@@ -2519,6 +2671,12 @@ static int qemu_rdma_dest_init(RDMAContext *rdma, Error **errp)
         goto err_dest_init_bind_addr;
     }
 
+    ret = rdma_set_option(listen_id, RDMA_OPTION_ID, RDMA_OPTION_ID_REUSEADDR,
+                          &reuse, sizeof reuse);
+    if (ret) {
+        ERROR(errp, "Error: could not set REUSEADDR option");
+        goto err_dest_init_bind_addr;
+    }
     for (e = res; e != NULL; e = e->ai_next) {
         inet_ntop(e->ai_family,
             &((struct sockaddr_in *) e->ai_dst_addr)->sin_addr, ip, sizeof ip);
@@ -2536,6 +2694,7 @@ static int qemu_rdma_dest_init(RDMAContext *rdma, Error **errp)
         break;
     }
 
+    rdma_freeaddrinfo(res);
     if (!e) {
         ERROR(errp, "Error: could not rdma_bind_addr!");
         goto err_dest_init_bind_addr;
@@ -2555,6 +2714,25 @@ err_dest_init_create_listen_id:
 
 }
 
+static void qemu_rdma_return_path_dest_init(RDMAContext *rdma_return_path,
+                                            RDMAContext *rdma)
+{
+    int idx;
+
+    for (idx = 0; idx < RDMA_WRID_MAX; idx++) {
+        rdma_return_path->wr_data[idx].control_len = 0;
+        rdma_return_path->wr_data[idx].control_curr = NULL;
+    }
+
+    /*the CM channel and CM id is shared*/
+    rdma_return_path->channel = rdma->channel;
+    rdma_return_path->listen_id = rdma->listen_id;
+
+    rdma->return_path = rdma_return_path;
+    rdma_return_path->return_path = rdma;
+    rdma_return_path->is_return_path = true;
+}
+
 static void *qemu_rdma_data_init(const char *host_port, Error **errp)
 {
     RDMAContext *rdma = NULL;
@@ -2569,6 +2747,7 @@ static void *qemu_rdma_data_init(const char *host_port, Error **errp)
         if (!inet_parse(addr, host_port, NULL)) {
             rdma->port = atoi(addr->port);
             rdma->host = g_strdup(addr->host);
+            rdma->host_port = g_strdup(host_port);
         } else {
             ERROR(errp, "bad RDMA migration address '%s'", host_port);
             g_free(rdma);
@@ -2591,15 +2770,23 @@ static ssize_t qio_channel_rdma_writev(QIOChannel *ioc,
                                        size_t niov,
                                        int *fds,
                                        size_t nfds,
+                                       int flags,
                                        Error **errp)
 {
     QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(ioc);
     QEMUFile *f = rioc->file;
-    RDMAContext *rdma = rioc->rdma;
+    RDMAContext *rdma;
     int ret;
     ssize_t done = 0;
     size_t i;
     size_t len = 0;
+
+    RCU_READ_LOCK_GUARD();
+    rdma = qatomic_rcu_read(&rioc->rdmaout);
+
+    if (!rdma) {
+        return -EIO;
+    }
 
     CHECK_ERROR_STATE();
 
@@ -2670,11 +2857,18 @@ static ssize_t qio_channel_rdma_readv(QIOChannel *ioc,
                                       Error **errp)
 {
     QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(ioc);
-    RDMAContext *rdma = rioc->rdma;
+    RDMAContext *rdma;
     RDMAControlHeader head;
     int ret = 0;
     ssize_t i;
     size_t done = 0;
+
+    RCU_READ_LOCK_GUARD();
+    rdma = qatomic_rcu_read(&rioc->rdmain);
+
+    if (!rdma) {
+        return -EIO;
+    }
 
     CHECK_ERROR_STATE();
 
@@ -2687,7 +2881,7 @@ static ssize_t qio_channel_rdma_readv(QIOChannel *ioc,
          * were given and dish out the bytes until we run
          * out of bytes.
          */
-        ret = qemu_rdma_fill(rioc->rdma, data, want, 0);
+        ret = qemu_rdma_fill(rdma, data, want, 0);
         done += ret;
         want -= ret;
         /* Got what we needed, so go to next iovec */
@@ -2715,7 +2909,7 @@ static ssize_t qio_channel_rdma_readv(QIOChannel *ioc,
         /*
          * SEND was received with new bytes, now try again.
          */
-        ret = qemu_rdma_fill(rioc->rdma, data, want, 0);
+        ret = qemu_rdma_fill(rdma, data, want, 0);
         done += ret;
         want -= ret;
 
@@ -2779,9 +2973,21 @@ qio_channel_rdma_source_prepare(GSource *source,
                                 gint *timeout)
 {
     QIOChannelRDMASource *rsource = (QIOChannelRDMASource *)source;
-    RDMAContext *rdma = rsource->rioc->rdma;
+    RDMAContext *rdma;
     GIOCondition cond = 0;
     *timeout = -1;
+
+    RCU_READ_LOCK_GUARD();
+    if (rsource->condition == G_IO_IN) {
+        rdma = qatomic_rcu_read(&rsource->rioc->rdmain);
+    } else {
+        rdma = qatomic_rcu_read(&rsource->rioc->rdmaout);
+    }
+
+    if (!rdma) {
+        error_report("RDMAContext is NULL when prepare Gsource");
+        return FALSE;
+    }
 
     if (rdma->wr_data[0].control_len) {
         cond |= G_IO_IN;
@@ -2795,8 +3001,20 @@ static gboolean
 qio_channel_rdma_source_check(GSource *source)
 {
     QIOChannelRDMASource *rsource = (QIOChannelRDMASource *)source;
-    RDMAContext *rdma = rsource->rioc->rdma;
+    RDMAContext *rdma;
     GIOCondition cond = 0;
+
+    RCU_READ_LOCK_GUARD();
+    if (rsource->condition == G_IO_IN) {
+        rdma = qatomic_rcu_read(&rsource->rioc->rdmain);
+    } else {
+        rdma = qatomic_rcu_read(&rsource->rioc->rdmaout);
+    }
+
+    if (!rdma) {
+        error_report("RDMAContext is NULL when check Gsource");
+        return FALSE;
+    }
 
     if (rdma->wr_data[0].control_len) {
         cond |= G_IO_IN;
@@ -2813,8 +3031,20 @@ qio_channel_rdma_source_dispatch(GSource *source,
 {
     QIOChannelFunc func = (QIOChannelFunc)callback;
     QIOChannelRDMASource *rsource = (QIOChannelRDMASource *)source;
-    RDMAContext *rdma = rsource->rioc->rdma;
+    RDMAContext *rdma;
     GIOCondition cond = 0;
+
+    RCU_READ_LOCK_GUARD();
+    if (rsource->condition == G_IO_IN) {
+        rdma = qatomic_rcu_read(&rsource->rioc->rdmain);
+    } else {
+        rdma = qatomic_rcu_read(&rsource->rioc->rdmaout);
+    }
+
+    if (!rdma) {
+        error_report("RDMAContext is NULL when dispatch Gsource");
+        return FALSE;
+    }
 
     if (rdma->wr_data[0].control_len) {
         cond |= G_IO_IN;
@@ -2860,20 +3090,109 @@ static GSource *qio_channel_rdma_create_watch(QIOChannel *ioc,
     return source;
 }
 
+static void qio_channel_rdma_set_aio_fd_handler(QIOChannel *ioc,
+                                                  AioContext *ctx,
+                                                  IOHandler *io_read,
+                                                  IOHandler *io_write,
+                                                  void *opaque)
+{
+    QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(ioc);
+    if (io_read) {
+        aio_set_fd_handler(ctx, rioc->rdmain->recv_comp_channel->fd,
+                           false, io_read, io_write, NULL, NULL, opaque);
+        aio_set_fd_handler(ctx, rioc->rdmain->send_comp_channel->fd,
+                           false, io_read, io_write, NULL, NULL, opaque);
+    } else {
+        aio_set_fd_handler(ctx, rioc->rdmaout->recv_comp_channel->fd,
+                           false, io_read, io_write, NULL, NULL, opaque);
+        aio_set_fd_handler(ctx, rioc->rdmaout->send_comp_channel->fd,
+                           false, io_read, io_write, NULL, NULL, opaque);
+    }
+}
+
+struct rdma_close_rcu {
+    struct rcu_head rcu;
+    RDMAContext *rdmain;
+    RDMAContext *rdmaout;
+};
+
+/* callback from qio_channel_rdma_close via call_rcu */
+static void qio_channel_rdma_close_rcu(struct rdma_close_rcu *rcu)
+{
+    if (rcu->rdmain) {
+        qemu_rdma_cleanup(rcu->rdmain);
+    }
+
+    if (rcu->rdmaout) {
+        qemu_rdma_cleanup(rcu->rdmaout);
+    }
+
+    g_free(rcu->rdmain);
+    g_free(rcu->rdmaout);
+    g_free(rcu);
+}
 
 static int qio_channel_rdma_close(QIOChannel *ioc,
                                   Error **errp)
 {
     QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(ioc);
+    RDMAContext *rdmain, *rdmaout;
+    struct rdma_close_rcu *rcu = g_new(struct rdma_close_rcu, 1);
+
     trace_qemu_rdma_close();
-    if (rioc->rdma) {
-        if (!rioc->rdma->error_state) {
-            rioc->rdma->error_state = qemu_file_get_error(rioc->file);
-        }
-        qemu_rdma_cleanup(rioc->rdma);
-        g_free(rioc->rdma);
-        rioc->rdma = NULL;
+
+    rdmain = rioc->rdmain;
+    if (rdmain) {
+        qatomic_rcu_set(&rioc->rdmain, NULL);
     }
+
+    rdmaout = rioc->rdmaout;
+    if (rdmaout) {
+        qatomic_rcu_set(&rioc->rdmaout, NULL);
+    }
+
+    rcu->rdmain = rdmain;
+    rcu->rdmaout = rdmaout;
+    call_rcu(rcu, qio_channel_rdma_close_rcu, rcu);
+
+    return 0;
+}
+
+static int
+qio_channel_rdma_shutdown(QIOChannel *ioc,
+                            QIOChannelShutdown how,
+                            Error **errp)
+{
+    QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(ioc);
+    RDMAContext *rdmain, *rdmaout;
+
+    RCU_READ_LOCK_GUARD();
+
+    rdmain = qatomic_rcu_read(&rioc->rdmain);
+    rdmaout = qatomic_rcu_read(&rioc->rdmain);
+
+    switch (how) {
+    case QIO_CHANNEL_SHUTDOWN_READ:
+        if (rdmain) {
+            rdmain->error_state = -1;
+        }
+        break;
+    case QIO_CHANNEL_SHUTDOWN_WRITE:
+        if (rdmaout) {
+            rdmaout->error_state = -1;
+        }
+        break;
+    case QIO_CHANNEL_SHUTDOWN_BOTH:
+    default:
+        if (rdmain) {
+            rdmain->error_state = -1;
+        }
+        if (rdmaout) {
+            rdmaout->error_state = -1;
+        }
+        break;
+    }
+
     return 0;
 }
 
@@ -2889,95 +3208,56 @@ static int qio_channel_rdma_close(QIOChannel *ioc,
  *        Offset is an offset to be added to block_offset and used
  *        to also lookup the corresponding RAMBlock.
  *
- *    @size > 0 :
- *        Initiate an transfer this size.
- *
- *    @size == 0 :
- *        A 'hint' or 'advice' that means that we wish to speculatively
- *        and asynchronously unregister this memory. In this case, there is no
- *        guarantee that the unregister will actually happen, for example,
- *        if the memory is being actively transmitted. Additionally, the memory
- *        may be re-registered at any future time if a write within the same
- *        chunk was requested again, even if you attempted to unregister it
- *        here.
- *
- *    @size < 0 : TODO, not yet supported
- *        Unregister the memory NOW. This means that the caller does not
- *        expect there to be any future RDMA transfers and we just want to clean
- *        things up. This is used in case the upper layer owns the memory and
- *        cannot wait for qemu_fclose() to occur.
+ *    @size : Number of bytes to transfer
  *
  *    @bytes_sent : User-specificed pointer to indicate how many bytes were
  *                  sent. Usually, this will not be more than a few bytes of
  *                  the protocol because most transfers are sent asynchronously.
  */
-static size_t qemu_rdma_save_page(QEMUFile *f, void *opaque,
+static size_t qemu_rdma_save_page(QEMUFile *f,
                                   ram_addr_t block_offset, ram_addr_t offset,
                                   size_t size, uint64_t *bytes_sent)
 {
-    QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(opaque);
-    RDMAContext *rdma = rioc->rdma;
+    QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(qemu_file_get_ioc(f));
+    RDMAContext *rdma;
     int ret;
+
+    RCU_READ_LOCK_GUARD();
+    rdma = qatomic_rcu_read(&rioc->rdmaout);
+
+    if (!rdma) {
+        return -EIO;
+    }
 
     CHECK_ERROR_STATE();
 
+    if (migration_in_postcopy()) {
+        return RAM_SAVE_CONTROL_NOT_SUPP;
+    }
+
     qemu_fflush(f);
 
-    if (size > 0) {
-        /*
-         * Add this page to the current 'chunk'. If the chunk
-         * is full, or the page doen't belong to the current chunk,
-         * an actual RDMA write will occur and a new chunk will be formed.
-         */
-        ret = qemu_rdma_write(f, rdma, block_offset, offset, size);
-        if (ret < 0) {
-            error_report("rdma migration: write error! %d", ret);
-            goto err;
-        }
+    /*
+     * Add this page to the current 'chunk'. If the chunk
+     * is full, or the page doesn't belong to the current chunk,
+     * an actual RDMA write will occur and a new chunk will be formed.
+     */
+    ret = qemu_rdma_write(f, rdma, block_offset, offset, size);
+    if (ret < 0) {
+        error_report("rdma migration: write error! %d", ret);
+        goto err;
+    }
 
-        /*
-         * We always return 1 bytes because the RDMA
-         * protocol is completely asynchronous. We do not yet know
-         * whether an  identified chunk is zero or not because we're
-         * waiting for other pages to potentially be merged with
-         * the current chunk. So, we have to call qemu_update_position()
-         * later on when the actual write occurs.
-         */
-        if (bytes_sent) {
-            *bytes_sent = 1;
-        }
-    } else {
-        uint64_t index, chunk;
-
-        /* TODO: Change QEMUFileOps prototype to be signed: size_t => long
-        if (size < 0) {
-            ret = qemu_rdma_drain_cq(f, rdma);
-            if (ret < 0) {
-                fprintf(stderr, "rdma: failed to synchronously drain"
-                                " completion queue before unregistration.\n");
-                goto err;
-            }
-        }
-        */
-
-        ret = qemu_rdma_search_ram_block(rdma, block_offset,
-                                         offset, size, &index, &chunk);
-
-        if (ret) {
-            error_report("ram block search failed");
-            goto err;
-        }
-
-        qemu_rdma_signal_unregister(rdma, index, chunk, 0);
-
-        /*
-         * TODO: Synchronous, guaranteed unregistration (should not occur during
-         * fast-path). Otherwise, unregisters will process on the next call to
-         * qemu_rdma_drain_cq()
-        if (size < 0) {
-            qemu_rdma_unregister_waiting(rdma);
-        }
-        */
+    /*
+     * We always return 1 bytes because the RDMA
+     * protocol is completely asynchronous. We do not yet know
+     * whether an  identified chunk is zero or not because we're
+     * waiting for other pages to potentially be merged with
+     * the current chunk. So, we have to call qemu_update_position()
+     * later on when the actual write occurs.
+     */
+    if (bytes_sent) {
+        *bytes_sent = 1;
     }
 
     /*
@@ -2989,7 +3269,22 @@ static size_t qemu_rdma_save_page(QEMUFile *f, void *opaque,
      */
     while (1) {
         uint64_t wr_id, wr_id_in;
-        int ret = qemu_rdma_poll(rdma, &wr_id_in, NULL);
+        int ret = qemu_rdma_poll(rdma, rdma->recv_cq, &wr_id_in, NULL);
+        if (ret < 0) {
+            error_report("rdma migration: polling error! %d", ret);
+            goto err;
+        }
+
+        wr_id = wr_id_in & RDMA_WRID_TYPE_MASK;
+
+        if (wr_id == RDMA_WRID_NONE) {
+            break;
+        }
+    }
+
+    while (1) {
+        uint64_t wr_id, wr_id_in;
+        int ret = qemu_rdma_poll(rdma, rdma->send_cq, &wr_id_in, NULL);
         if (ret < 0) {
             error_report("rdma migration: polling error! %d", ret);
             goto err;
@@ -3008,6 +3303,42 @@ err:
     return ret;
 }
 
+static void rdma_accept_incoming_migration(void *opaque);
+
+static void rdma_cm_poll_handler(void *opaque)
+{
+    RDMAContext *rdma = opaque;
+    int ret;
+    struct rdma_cm_event *cm_event;
+    MigrationIncomingState *mis = migration_incoming_get_current();
+
+    ret = rdma_get_cm_event(rdma->channel, &cm_event);
+    if (ret) {
+        error_report("get_cm_event failed %d", errno);
+        return;
+    }
+
+    if (cm_event->event == RDMA_CM_EVENT_DISCONNECTED ||
+        cm_event->event == RDMA_CM_EVENT_DEVICE_REMOVAL) {
+        if (!rdma->error_state &&
+            migration_incoming_get_current()->state !=
+              MIGRATION_STATUS_COMPLETED) {
+            error_report("receive cm event, cm event is %d", cm_event->event);
+            rdma->error_state = -EPIPE;
+            if (rdma->return_path) {
+                rdma->return_path->error_state = -EPIPE;
+            }
+        }
+        rdma_ack_cm_event(cm_event);
+
+        if (mis->migration_incoming_co) {
+            qemu_coroutine_enter(mis->migration_incoming_co);
+        }
+        return;
+    }
+    rdma_ack_cm_event(cm_event);
+}
+
 static int qemu_rdma_accept(RDMAContext *rdma)
 {
     RDMACapabilities cap;
@@ -3016,6 +3347,7 @@ static int qemu_rdma_accept(RDMAContext *rdma)
                                             .private_data = &cap,
                                             .private_data_len = sizeof(cap),
                                          };
+    RDMAContext *rdma_return_path = NULL;
     struct rdma_cm_event *cm_event;
     struct ibv_context *verbs;
     int ret = -EINVAL;
@@ -3029,6 +3361,20 @@ static int qemu_rdma_accept(RDMAContext *rdma)
     if (cm_event->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
         rdma_ack_cm_event(cm_event);
         goto err_rdma_dest_wait;
+    }
+
+    /*
+     * initialize the RDMAContext for return path for postcopy after first
+     * connection request reached.
+     */
+    if (migrate_postcopy() && !rdma->is_return_path) {
+        rdma_return_path = qemu_rdma_data_init(rdma->host_port, NULL);
+        if (rdma_return_path == NULL) {
+            rdma_ack_cm_event(cm_event);
+            goto err_rdma_dest_wait;
+        }
+
+        qemu_rdma_return_path_dest_init(rdma_return_path, rdma);
     }
 
     memcpy(&cap, cm_event->param.conn.private_data, sizeof(cap));
@@ -3102,7 +3448,15 @@ static int qemu_rdma_accept(RDMAContext *rdma)
         }
     }
 
-    qemu_set_fd_handler(rdma->channel->fd, NULL, NULL, NULL);
+    /* Accept the second connection request for return path */
+    if (migrate_postcopy() && !rdma->is_return_path) {
+        qemu_set_fd_handler(rdma->channel->fd, rdma_accept_incoming_migration,
+                            NULL,
+                            (void *)(intptr_t)rdma->return_path);
+    } else {
+        qemu_set_fd_handler(rdma->channel->fd, rdma_cm_poll_handler,
+                            NULL, rdma);
+    }
 
     ret = rdma_accept(rdma->cm_id, &conn_param);
     if (ret) {
@@ -3138,6 +3492,7 @@ static int qemu_rdma_accept(RDMAContext *rdma)
 err_rdma_dest_wait:
     rdma->error_state = ret;
     qemu_rdma_cleanup(rdma);
+    g_free(rdma_return_path);
     return ret;
 }
 
@@ -3171,8 +3526,8 @@ static int qemu_rdma_registration_handle(QEMUFile *f, void *opaque)
     RDMAControlHeader blocks = { .type = RDMA_CONTROL_RAM_BLOCKS_RESULT,
                                  .repeat = 1 };
     QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(opaque);
-    RDMAContext *rdma = rioc->rdma;
-    RDMALocalBlocks *local = &rdma->local_ram_blocks;
+    RDMAContext *rdma;
+    RDMALocalBlocks *local;
     RDMAControlHeader head;
     RDMARegister *reg, *registers;
     RDMACompress *comp;
@@ -3185,8 +3540,16 @@ static int qemu_rdma_registration_handle(QEMUFile *f, void *opaque)
     int count = 0;
     int i = 0;
 
+    RCU_READ_LOCK_GUARD();
+    rdma = qatomic_rcu_read(&rioc->rdmain);
+
+    if (!rdma) {
+        return -EIO;
+    }
+
     CHECK_ERROR_STATE();
 
+    local = &rdma->local_ram_blocks;
     do {
         trace_qemu_rdma_registration_handle_wait();
 
@@ -3346,13 +3709,16 @@ static int qemu_rdma_registration_handle(QEMUFile *f, void *opaque)
                 }
                 chunk_start = ram_chunk_start(block, chunk);
                 chunk_end = ram_chunk_end(block, chunk + reg->chunks);
+                /* avoid "-Waddress-of-packed-member" warning */
+                uint32_t tmp_rkey = 0;
                 if (qemu_rdma_register_and_get_keys(rdma, block,
-                            (uintptr_t)host_addr, NULL, &reg_result->rkey,
+                            (uintptr_t)host_addr, NULL, &tmp_rkey,
                             chunk, chunk_start, chunk_end)) {
                     error_report("cannot get rkey");
                     ret = -EINVAL;
                     goto out;
                 }
+                reg_result->rkey = tmp_rkey;
 
                 reg_result->host_addr = (uintptr_t)block->local_host_addr;
 
@@ -3433,9 +3799,16 @@ out:
 static int
 rdma_block_notification_handle(QIOChannelRDMA *rioc, const char *name)
 {
-    RDMAContext *rdma = rioc->rdma;
+    RDMAContext *rdma;
     int curr;
     int found = -1;
+
+    RCU_READ_LOCK_GUARD();
+    rdma = qatomic_rcu_read(&rioc->rdmain);
+
+    if (!rdma) {
+        return -EIO;
+    }
 
     /* Find the matching RAMBlock in our local list */
     for (curr = 0; curr < rdma->local_ram_blocks.nb_blocks; curr++) {
@@ -3457,14 +3830,15 @@ rdma_block_notification_handle(QIOChannelRDMA *rioc, const char *name)
     return 0;
 }
 
-static int rdma_load_hook(QEMUFile *f, void *opaque, uint64_t flags, void *data)
+static int rdma_load_hook(QEMUFile *f, uint64_t flags, void *data)
 {
+    QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(qemu_file_get_ioc(f));
     switch (flags) {
     case RAM_CONTROL_BLOCK_REG:
-        return rdma_block_notification_handle(opaque, data);
+        return rdma_block_notification_handle(rioc, data);
 
     case RAM_CONTROL_HOOK:
-        return qemu_rdma_registration_handle(f, opaque);
+        return qemu_rdma_registration_handle(f, rioc);
 
     default:
         /* Shouldn't be called with any other values */
@@ -3472,13 +3846,23 @@ static int rdma_load_hook(QEMUFile *f, void *opaque, uint64_t flags, void *data)
     }
 }
 
-static int qemu_rdma_registration_start(QEMUFile *f, void *opaque,
+static int qemu_rdma_registration_start(QEMUFile *f,
                                         uint64_t flags, void *data)
 {
-    QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(opaque);
-    RDMAContext *rdma = rioc->rdma;
+    QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(qemu_file_get_ioc(f));
+    RDMAContext *rdma;
+
+    RCU_READ_LOCK_GUARD();
+    rdma = qatomic_rcu_read(&rioc->rdmaout);
+    if (!rdma) {
+        return -EIO;
+    }
 
     CHECK_ERROR_STATE();
+
+    if (migration_in_postcopy()) {
+        return 0;
+    }
 
     trace_qemu_rdma_registration_start(flags);
     qemu_put_be64(f, RAM_SAVE_FLAG_HOOK);
@@ -3491,16 +3875,25 @@ static int qemu_rdma_registration_start(QEMUFile *f, void *opaque,
  * Inform dest that dynamic registrations are done for now.
  * First, flush writes, if any.
  */
-static int qemu_rdma_registration_stop(QEMUFile *f, void *opaque,
+static int qemu_rdma_registration_stop(QEMUFile *f,
                                        uint64_t flags, void *data)
 {
-    Error *local_err = NULL, **errp = &local_err;
-    QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(opaque);
-    RDMAContext *rdma = rioc->rdma;
+    QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(qemu_file_get_ioc(f));
+    RDMAContext *rdma;
     RDMAControlHeader head = { .len = 0, .repeat = 1 };
     int ret = 0;
 
+    RCU_READ_LOCK_GUARD();
+    rdma = qatomic_rcu_read(&rioc->rdmaout);
+    if (!rdma) {
+        return -EIO;
+    }
+
     CHECK_ERROR_STATE();
+
+    if (migration_in_postcopy()) {
+        return 0;
+    }
 
     qemu_fflush(f);
     ret = qemu_rdma_drain_cq(f, rdma);
@@ -3529,7 +3922,7 @@ static int qemu_rdma_registration_stop(QEMUFile *f, void *opaque,
                     &reg_result_idx, rdma->pin_all ?
                     qemu_rdma_reg_whole_ram_blocks : NULL);
         if (ret < 0) {
-            ERROR(errp, "receiving remote info!");
+            fprintf(stderr, "receiving remote info!");
             return ret;
         }
 
@@ -3548,10 +3941,10 @@ static int qemu_rdma_registration_stop(QEMUFile *f, void *opaque,
          */
 
         if (local->nb_blocks != nb_dest_blocks) {
-            ERROR(errp, "ram blocks mismatch (Number of blocks %d vs %d) "
-                        "Your QEMU command line parameters are probably "
-                        "not identical on both the source and destination.",
-                        local->nb_blocks, nb_dest_blocks);
+            fprintf(stderr, "ram blocks mismatch (Number of blocks %d vs %d) "
+                    "Your QEMU command line parameters are probably "
+                    "not identical on both the source and destination.",
+                    local->nb_blocks, nb_dest_blocks);
             rdma->error_state = -EINVAL;
             return -EINVAL;
         }
@@ -3564,10 +3957,10 @@ static int qemu_rdma_registration_stop(QEMUFile *f, void *opaque,
 
             /* We require that the blocks are in the same order */
             if (rdma->dest_blocks[i].length != local->block[i].length) {
-                ERROR(errp, "Block %s/%d has a different length %" PRIu64
-                            "vs %" PRIu64, local->block[i].block_name, i,
-                            local->block[i].length,
-                            rdma->dest_blocks[i].length);
+                fprintf(stderr, "Block %s/%d has a different length %" PRIu64
+                        "vs %" PRIu64, local->block[i].block_name, i,
+                        local->block[i].length,
+                        rdma->dest_blocks[i].length);
                 rdma->error_state = -EINVAL;
                 return -EINVAL;
             }
@@ -3606,10 +3999,15 @@ static const QEMUFileHooks rdma_write_hooks = {
 static void qio_channel_rdma_finalize(Object *obj)
 {
     QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(obj);
-    if (rioc->rdma) {
-        qemu_rdma_cleanup(rioc->rdma);
-        g_free(rioc->rdma);
-        rioc->rdma = NULL;
+    if (rioc->rdmain) {
+        qemu_rdma_cleanup(rioc->rdmain);
+        g_free(rioc->rdmain);
+        rioc->rdmain = NULL;
+    }
+    if (rioc->rdmaout) {
+        qemu_rdma_cleanup(rioc->rdmaout);
+        g_free(rioc->rdmaout);
+        rioc->rdmaout = NULL;
     }
 }
 
@@ -3623,6 +4021,8 @@ static void qio_channel_rdma_class_init(ObjectClass *klass,
     ioc_klass->io_set_blocking = qio_channel_rdma_set_blocking;
     ioc_klass->io_close = qio_channel_rdma_close;
     ioc_klass->io_create_watch = qio_channel_rdma_create_watch;
+    ioc_klass->io_set_aio_fd_handler = qio_channel_rdma_set_aio_fd_handler;
+    ioc_klass->io_shutdown = qio_channel_rdma_shutdown;
 }
 
 static const TypeInfo qio_channel_rdma_info = {
@@ -3649,13 +4049,16 @@ static QEMUFile *qemu_fopen_rdma(RDMAContext *rdma, const char *mode)
     }
 
     rioc = QIO_CHANNEL_RDMA(object_new(TYPE_QIO_CHANNEL_RDMA));
-    rioc->rdma = rdma;
 
     if (mode[0] == 'w') {
-        rioc->file = qemu_fopen_channel_output(QIO_CHANNEL(rioc));
+        rioc->file = qemu_file_new_output(QIO_CHANNEL(rioc));
+        rioc->rdmaout = rdma;
+        rioc->rdmain = rdma->return_path;
         qemu_file_set_hooks(rioc->file, &rdma_write_hooks);
     } else {
-        rioc->file = qemu_fopen_channel_input(QIO_CHANNEL(rioc));
+        rioc->file = qemu_file_new_input(QIO_CHANNEL(rioc));
+        rioc->rdmain = rdma;
+        rioc->rdmaout = rdma->return_path;
         qemu_file_set_hooks(rioc->file, &rdma_read_hooks);
     }
 
@@ -3667,38 +4070,51 @@ static void rdma_accept_incoming_migration(void *opaque)
     RDMAContext *rdma = opaque;
     int ret;
     QEMUFile *f;
-    Error *local_err = NULL, **errp = &local_err;
+    Error *local_err = NULL;
 
     trace_qemu_rdma_accept_incoming_migration();
     ret = qemu_rdma_accept(rdma);
 
     if (ret) {
-        ERROR(errp, "RDMA Migration initialization failed!");
+        fprintf(stderr, "RDMA ERROR: Migration initialization failed\n");
         return;
     }
 
     trace_qemu_rdma_accept_incoming_migration_accepted();
 
+    if (rdma->is_return_path) {
+        return;
+    }
+
     f = qemu_fopen_rdma(rdma, "rb");
     if (f == NULL) {
-        ERROR(errp, "could not qemu_fopen_rdma!");
+        fprintf(stderr, "RDMA ERROR: could not qemu_fopen_rdma\n");
         qemu_rdma_cleanup(rdma);
         return;
     }
 
     rdma->migration_started_on_destination = 1;
-    migration_fd_process_incoming(f);
+    migration_fd_process_incoming(f, &local_err);
+    if (local_err) {
+        error_reportf_err(local_err, "RDMA ERROR:");
+    }
 }
 
 void rdma_start_incoming_migration(const char *host_port, Error **errp)
 {
     int ret;
-    RDMAContext *rdma;
+    RDMAContext *rdma, *rdma_return_path = NULL;
     Error *local_err = NULL;
 
     trace_rdma_start_incoming_migration();
-    rdma = qemu_rdma_data_init(host_port, &local_err);
 
+    /* Avoid ram_block_discard_disable(), cannot change during migration. */
+    if (ram_block_discard_is_required()) {
+        error_setg(errp, "RDMA: cannot disable RAM discard");
+        return;
+    }
+
+    rdma = qemu_rdma_data_init(host_port, &local_err);
     if (rdma == NULL) {
         goto err;
     }
@@ -3715,7 +4131,7 @@ void rdma_start_incoming_migration(const char *host_port, Error **errp)
 
     if (ret) {
         ERROR(errp, "listening on socket!");
-        goto err;
+        goto cleanup_rdma;
     }
 
     trace_rdma_start_incoming_migration_after_rdma_listen();
@@ -3723,18 +4139,34 @@ void rdma_start_incoming_migration(const char *host_port, Error **errp)
     qemu_set_fd_handler(rdma->channel->fd, rdma_accept_incoming_migration,
                         NULL, (void *)(intptr_t)rdma);
     return;
+
+cleanup_rdma:
+    qemu_rdma_cleanup(rdma);
 err:
     error_propagate(errp, local_err);
+    if (rdma) {
+        g_free(rdma->host);
+        g_free(rdma->host_port);
+    }
     g_free(rdma);
+    g_free(rdma_return_path);
 }
 
 void rdma_start_outgoing_migration(void *opaque,
                             const char *host_port, Error **errp)
 {
     MigrationState *s = opaque;
-    RDMAContext *rdma = qemu_rdma_data_init(host_port, errp);
+    RDMAContext *rdma_return_path = NULL;
+    RDMAContext *rdma;
     int ret = 0;
 
+    /* Avoid ram_block_discard_disable(), cannot change during migration. */
+    if (ram_block_discard_is_required()) {
+        error_setg(errp, "RDMA: cannot disable RAM discard");
+        return;
+    }
+
+    rdma = qemu_rdma_data_init(host_port, errp);
     if (rdma == NULL) {
         goto err;
     }
@@ -3747,10 +4179,36 @@ void rdma_start_outgoing_migration(void *opaque,
     }
 
     trace_rdma_start_outgoing_migration_after_rdma_source_init();
-    ret = qemu_rdma_connect(rdma, errp);
+    ret = qemu_rdma_connect(rdma, errp, false);
 
     if (ret) {
         goto err;
+    }
+
+    /* RDMA postcopy need a separate queue pair for return path */
+    if (migrate_postcopy()) {
+        rdma_return_path = qemu_rdma_data_init(host_port, errp);
+
+        if (rdma_return_path == NULL) {
+            goto return_path_err;
+        }
+
+        ret = qemu_rdma_source_init(rdma_return_path,
+            s->enabled_capabilities[MIGRATION_CAPABILITY_RDMA_PIN_ALL], errp);
+
+        if (ret) {
+            goto return_path_err;
+        }
+
+        ret = qemu_rdma_connect(rdma_return_path, errp, true);
+
+        if (ret) {
+            goto return_path_err;
+        }
+
+        rdma->return_path = rdma_return_path;
+        rdma_return_path->return_path = rdma;
+        rdma_return_path->is_return_path = true;
     }
 
     trace_rdma_start_outgoing_migration_after_rdma_connect();
@@ -3758,6 +4216,9 @@ void rdma_start_outgoing_migration(void *opaque,
     s->to_dst_file = qemu_fopen_rdma(rdma, "wb");
     migrate_fd_connect(s, NULL);
     return;
+return_path_err:
+    qemu_rdma_cleanup(rdma);
 err:
     g_free(rdma);
+    g_free(rdma_return_path);
 }

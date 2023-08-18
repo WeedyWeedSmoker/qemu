@@ -1,12 +1,15 @@
 #ifndef XEN_PT_H
 #define XEN_PT_H
 
-#include "qemu-common.h"
 #include "hw/xen/xen_common.h"
 #include "hw/pci/pci.h"
 #include "xen-host-pci-device.h"
+#include "qom/object.h"
 
-void xen_pt_log(const PCIDevice *d, const char *f, ...) GCC_FMT_ATTR(2, 3);
+bool xen_igd_gfx_pt_enabled(void);
+void xen_igd_gfx_pt_set(bool value, Error **errp);
+
+void xen_pt_log(const PCIDevice *d, const char *f, ...) G_GNUC_PRINTF(2, 3);
 
 #define XEN_PT_ERR(d, _f, _a...) xen_pt_log(d, "%s: Error: "_f, __func__, ##_a)
 
@@ -34,14 +37,14 @@ void xen_pt_log(const PCIDevice *d, const char *f, ...) GCC_FMT_ATTR(2, 3);
 typedef const struct XenPTRegInfo XenPTRegInfo;
 typedef struct XenPTReg XenPTReg;
 
-typedef struct XenPCIPassthroughState XenPCIPassthroughState;
 
 #define TYPE_XEN_PT_DEVICE "xen-pci-passthrough"
-#define XEN_PT_DEVICE(obj) \
-    OBJECT_CHECK(XenPCIPassthroughState, (obj), TYPE_XEN_PT_DEVICE)
+OBJECT_DECLARE_SIMPLE_TYPE(XenPCIPassthroughState, XEN_PT_DEVICE)
 
 uint32_t igd_read_opregion(XenPCIPassthroughState *s);
 void igd_write_opregion(XenPCIPassthroughState *s, uint32_t val);
+void xen_igd_passthrough_isa_bridge_create(XenPCIPassthroughState *s,
+                                           XenHostPCIDevice *dev);
 
 /* function type for config reg */
 typedef int (*xen_pt_conf_reg_init)
@@ -204,7 +207,7 @@ typedef struct XenPTMSIX {
     uint64_t mmio_base_addr;
     MemoryRegion mmio;
     void *phys_iomem_base;
-    XenPTMSIXEntry msix_entry[0];
+    XenPTMSIXEntry msix_entry[];
 } XenPTMSIX;
 
 struct XenPCIPassthroughState {
@@ -319,14 +322,13 @@ static inline bool xen_pt_has_msix_mapping(XenPCIPassthroughState *s, int bar)
 }
 
 extern void *pci_assign_dev_load_option_rom(PCIDevice *dev,
-                                            struct Object *owner, int *size,
+                                            int *size,
                                             unsigned int domain,
                                             unsigned int bus, unsigned int slot,
                                             unsigned int function);
-extern bool has_igd_gfx_passthru;
 static inline bool is_igd_vga_passthrough(XenHostPCIDevice *dev)
 {
-    return (has_igd_gfx_passthru
+    return (xen_igd_gfx_pt_enabled()
             && ((dev->class_code >> 0x8) == PCI_CLASS_DISPLAY_VGA));
 }
 int xen_pt_register_vga_regions(XenHostPCIDevice *dev);

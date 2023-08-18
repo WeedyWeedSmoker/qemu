@@ -12,10 +12,15 @@
  *
  */
 
+/*
+ * Not so fast! You might want to read the 9p developer docs first:
+ * https://wiki.qemu.org/Documentation/9p
+ */
+
 #include "qemu/osdep.h"
-#include "qemu-common.h"
 #include "block/thread-pool.h"
 #include "qemu/coroutine.h"
+#include "qemu/main-loop.h"
 #include "coth.h"
 
 /* Called from QEMU I/O thread.  */

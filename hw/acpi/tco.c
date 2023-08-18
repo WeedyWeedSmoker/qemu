@@ -6,24 +6,14 @@
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
  */
+
 #include "qemu/osdep.h"
-#include "qemu-common.h"
 #include "sysemu/watchdog.h"
 #include "hw/i386/ich9.h"
+#include "migration/vmstate.h"
 
 #include "hw/acpi/tco.h"
 #include "trace.h"
-
-//#define DEBUG
-
-#ifdef DEBUG
-#define TCO_DEBUG(fmt, ...)                                     \
-    do {                                                        \
-        fprintf(stderr, "%s "fmt, __func__, ## __VA_ARGS__);    \
-    } while (0)
-#else
-#define TCO_DEBUG(fmt, ...) do { } while (0)
-#endif
 
 enum {
     TCO_RLD_DEFAULT         = 0x0000,
@@ -249,7 +239,6 @@ const VMStateDescription vmstate_tco_io_sts = {
     .name = "tco io device status",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
     .fields      = (VMStateField[]) {
         VMSTATE_UINT16(tco.rld, TCOIORegs),
         VMSTATE_UINT8(tco.din, TCOIORegs),

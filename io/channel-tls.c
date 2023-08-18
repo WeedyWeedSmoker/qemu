@@ -6,7 +6,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -20,8 +20,10 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/module.h"
 #include "io/channel-tls.h"
 #include "trace.h"
+#include "qemu/atomic.h"
 
 
 static ssize_t qio_channel_tls_write_handler(const char *buf,
@@ -275,6 +277,10 @@ static ssize_t qio_channel_tls_readv(QIOChannel *ioc,
                 } else {
                     return QIO_CHANNEL_ERR_BLOCK;
                 }
+            } else if (errno == ECONNABORTED &&
+                       (qatomic_load_acquire(&tioc->shutdown) &
+                        QIO_CHANNEL_SHUTDOWN_READ)) {
+                return 0;
             }
 
             error_setg_errno(errp, errno,
@@ -295,6 +301,7 @@ static ssize_t qio_channel_tls_writev(QIOChannel *ioc,
                                       size_t niov,
                                       int *fds,
                                       size_t nfds,
+                                      int flags,
                                       Error **errp)
 {
     QIOChannelTLS *tioc = QIO_CHANNEL_TLS(ioc);
@@ -356,6 +363,8 @@ static int qio_channel_tls_shutdown(QIOChannel *ioc,
                                     Error **errp)
 {
     QIOChannelTLS *tioc = QIO_CHANNEL_TLS(ioc);
+
+    qatomic_or(&tioc->shutdown, how);
 
     return qio_channel_shutdown(tioc->master, how, errp);
 }

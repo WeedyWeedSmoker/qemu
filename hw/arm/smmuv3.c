@@ -17,12 +17,13 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/boards.h"
-#include "sysemu/sysemu.h"
+#include "qemu/bitops.h"
+#include "hw/irq.h"
 #include "hw/sysbus.h"
+#include "migration/vmstate.h"
 #include "hw/qdev-core.h"
 #include "hw/pci/pci.h"
-#include "exec/address-spaces.h"
+#include "cpu.h"
 #include "trace.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
@@ -30,6 +31,7 @@
 
 #include "hw/arm/smmuv3.h"
 #include "smmuv3-internal.h"
+#include "smmu-internal.h"
 
 /**
  * smmuv3_trigger_irq - pulse @irq if enabled and update
@@ -100,7 +102,8 @@ static inline MemTxResult queue_read(SMMUQueue *q, void *data)
 {
     dma_addr_t addr = Q_CONS_ENTRY(q);
 
-    return dma_memory_read(&address_space_memory, addr, data, q->entry_size);
+    return dma_memory_read(&address_space_memory, addr, data, q->entry_size,
+                           MEMTXATTRS_UNSPECIFIED);
 }
 
 static MemTxResult queue_write(SMMUQueue *q, void *data)
@@ -108,7 +111,8 @@ static MemTxResult queue_write(SMMUQueue *q, void *data)
     dma_addr_t addr = Q_PROD_ENTRY(q);
     MemTxResult ret;
 
-    ret = dma_memory_write(&address_space_memory, addr, data, q->entry_size);
+    ret = dma_memory_write(&address_space_memory, addr, data, q->entry_size,
+                           MEMTXATTRS_UNSPECIFIED);
     if (ret != MEMTX_OK) {
         return ret;
     }
@@ -135,7 +139,7 @@ static MemTxResult smmuv3_write_eventq(SMMUv3State *s, Evt *evt)
         return r;
     }
 
-    if (smmuv3_q_empty(q)) {
+    if (!smmuv3_q_empty(q)) {
         smmuv3_trigger_irq(s, SMMU_IRQ_EVTQ, 0);
     }
     return MEMTX_OK;
@@ -154,7 +158,7 @@ void smmuv3_record_event(SMMUv3State *s, SMMUEventInfo *info)
     EVT_SET_SID(&evt, info->sid);
 
     switch (info->type) {
-    case SMMU_EVT_OK:
+    case SMMU_EVT_NONE:
         return;
     case SMMU_EVT_F_UUT:
         EVT_SET_SSID(&evt, info->u.f_uut.ssid);
@@ -171,7 +175,7 @@ void smmuv3_record_event(SMMUv3State *s, SMMUEventInfo *info)
     case SMMU_EVT_F_STE_FETCH:
         EVT_SET_SSID(&evt, info->u.f_ste_fetch.ssid);
         EVT_SET_SSV(&evt,  info->u.f_ste_fetch.ssv);
-        EVT_SET_ADDR(&evt, info->u.f_ste_fetch.addr);
+        EVT_SET_ADDR2(&evt, info->u.f_ste_fetch.addr);
         break;
     case SMMU_EVT_C_BAD_STE:
         EVT_SET_SSID(&evt, info->u.c_bad_ste.ssid);
@@ -253,8 +257,13 @@ static void smmuv3_init_regs(SMMUv3State *s)
     s->idr[1] = FIELD_DP32(s->idr[1], IDR1, EVENTQS, SMMU_EVENTQS);
     s->idr[1] = FIELD_DP32(s->idr[1], IDR1, CMDQS,   SMMU_CMDQS);
 
-   /* 4K and 64K granule support */
+    s->idr[3] = FIELD_DP32(s->idr[3], IDR3, RIL, 1);
+    s->idr[3] = FIELD_DP32(s->idr[3], IDR3, HAD, 1);
+    s->idr[3] = FIELD_DP32(s->idr[3], IDR3, BBML, 2);
+
+    /* 4K, 16K and 64K granule support */
     s->idr[5] = FIELD_DP32(s->idr[5], IDR5, GRAN4K, 1);
+    s->idr[5] = FIELD_DP32(s->idr[5], IDR5, GRAN16K, 1);
     s->idr[5] = FIELD_DP32(s->idr[5], IDR5, GRAN64K, 1);
     s->idr[5] = FIELD_DP32(s->idr[5], IDR5, OAS, SMMU_IDR5_OAS); /* 44 bits */
 
@@ -269,6 +278,13 @@ static void smmuv3_init_regs(SMMUv3State *s)
 
     s->features = 0;
     s->sid_split = 0;
+    s->aidr = 0x1;
+    s->cr[0] = 0;
+    s->cr0ack = 0;
+    s->irq_ctrl = 0;
+    s->gerror = 0;
+    s->gerrorn = 0;
+    s->statusr = 0;
 }
 
 static int smmu_get_ste(SMMUv3State *s, dma_addr_t addr, STE *buf,
@@ -278,8 +294,8 @@ static int smmu_get_ste(SMMUv3State *s, dma_addr_t addr, STE *buf,
 
     trace_smmuv3_get_ste(addr);
     /* TODO: guarantee 64-bit single-copy atomicity */
-    ret = dma_memory_read(&address_space_memory, addr,
-                          (void *)buf, sizeof(*buf));
+    ret = dma_memory_read(&address_space_memory, addr, buf, sizeof(*buf),
+                          MEMTXATTRS_UNSPECIFIED);
     if (ret != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "Cannot fetch pte at address=0x%"PRIx64"\n", addr);
@@ -300,8 +316,8 @@ static int smmu_get_cd(SMMUv3State *s, STE *ste, uint32_t ssid,
 
     trace_smmuv3_get_cd(addr);
     /* TODO: guarantee 64-bit single-copy atomicity */
-    ret = dma_memory_read(&address_space_memory, addr,
-                           (void *)buf, sizeof(*buf));
+    ret = dma_memory_read(&address_space_memory, addr, buf, sizeof(*buf),
+                          MEMTXATTRS_UNSPECIFIED);
     if (ret != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "Cannot fetch pte at address=0x%"PRIx64"\n", addr);
@@ -312,27 +328,29 @@ static int smmu_get_cd(SMMUv3State *s, STE *ste, uint32_t ssid,
     return 0;
 }
 
-/* Returns <0 if the caller has no need to continue the translation */
+/* Returns < 0 in case of invalid STE, 0 otherwise */
 static int decode_ste(SMMUv3State *s, SMMUTransCfg *cfg,
                       STE *ste, SMMUEventInfo *event)
 {
     uint32_t config;
-    int ret = -EINVAL;
 
     if (!STE_VALID(ste)) {
+        if (!event->inval_ste_allowed) {
+            qemu_log_mask(LOG_GUEST_ERROR, "invalid STE\n");
+        }
         goto bad_ste;
     }
 
     config = STE_CONFIG(ste);
 
     if (STE_CFG_ABORT(config)) {
-        cfg->aborted = true; /* abort but don't record any event */
-        return ret;
+        cfg->aborted = true;
+        return 0;
     }
 
     if (STE_CFG_BYPASS(config)) {
         cfg->bypassed = true;
-        return ret;
+        return 0;
     }
 
     if (STE_CFG_S2_ENABLED(config)) {
@@ -373,27 +391,38 @@ bad_ste:
 static int smmu_find_ste(SMMUv3State *s, uint32_t sid, STE *ste,
                          SMMUEventInfo *event)
 {
-    dma_addr_t addr;
+    dma_addr_t addr, strtab_base;
+    uint32_t log2size;
+    int strtab_size_shift;
     int ret;
 
     trace_smmuv3_find_ste(sid, s->features, s->sid_split);
-    /* Check SID range */
-    if (sid > (1 << SMMU_IDR1_SIDSIZE)) {
+    log2size = FIELD_EX32(s->strtab_base_cfg, STRTAB_BASE_CFG, LOG2SIZE);
+    /*
+     * Check SID range against both guest-configured and implementation limits
+     */
+    if (sid >= (1 << MIN(log2size, SMMU_IDR1_SIDSIZE))) {
         event->type = SMMU_EVT_C_BAD_STREAMID;
         return -EINVAL;
     }
     if (s->features & SMMU_FEATURE_2LVL_STE) {
         int l1_ste_offset, l2_ste_offset, max_l2_ste, span;
-        dma_addr_t strtab_base, l1ptr, l2ptr;
+        dma_addr_t l1ptr, l2ptr;
         STEDesc l1std;
 
-        strtab_base = s->strtab_base & SMMU_BASE_ADDR_MASK;
+        /*
+         * Align strtab base address to table size. For this purpose, assume it
+         * is not bounded by SMMU_IDR1_SIDSIZE.
+         */
+        strtab_size_shift = MAX(5, (int)log2size - s->sid_split - 1 + 3);
+        strtab_base = s->strtab_base & SMMU_BASE_ADDR_MASK &
+                      ~MAKE_64BIT_MASK(0, strtab_size_shift);
         l1_ste_offset = sid >> s->sid_split;
         l2_ste_offset = sid & ((1 << s->sid_split) - 1);
         l1ptr = (dma_addr_t)(strtab_base + l1_ste_offset * sizeof(l1std));
         /* TODO: guarantee 64-bit single-copy atomicity */
-        ret = dma_memory_read(&address_space_memory, l1ptr,
-                              (uint8_t *)&l1std, sizeof(l1std));
+        ret = dma_memory_read(&address_space_memory, l1ptr, &l1std,
+                              sizeof(l1std), MEMTXATTRS_UNSPECIFIED);
         if (ret != MEMTX_OK) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "Could not read L1PTR at 0X%"PRIx64"\n", l1ptr);
@@ -406,8 +435,10 @@ static int smmu_find_ste(SMMUv3State *s, uint32_t sid, STE *ste,
 
         if (!span) {
             /* l2ptr is not valid */
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "invalid sid=%d (L1STD span=0)\n", sid);
+            if (!event->inval_ste_allowed) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "invalid sid=%d (L1STD span=0)\n", sid);
+            }
             event->type = SMMU_EVT_C_BAD_STREAMID;
             return -EINVAL;
         }
@@ -424,7 +455,10 @@ static int smmu_find_ste(SMMUv3State *s, uint32_t sid, STE *ste,
         }
         addr = l2ptr + l2_ste_offset * sizeof(*ste);
     } else {
-        addr = s->strtab_base + sid * sizeof(*ste);
+        strtab_size_shift = log2size + 5;
+        strtab_base = s->strtab_base & SMMU_BASE_ADDR_MASK &
+                      ~MAKE_64BIT_MASK(0, strtab_size_shift);
+        addr = strtab_base + sid * sizeof(*ste);
     }
 
     if (smmu_get_ste(s, addr, ste, event)) {
@@ -480,7 +514,8 @@ static int decode_cd(SMMUTransCfg *cfg, CD *cd, SMMUEventInfo *event)
 
         tg = CD_TG(cd, i);
         tt->granule_sz = tg2granule(tg, i);
-        if ((tt->granule_sz != 12 && tt->granule_sz != 16) || CD_ENDI(cd)) {
+        if ((tt->granule_sz != 12 && tt->granule_sz != 14 &&
+             tt->granule_sz != 16) || CD_ENDI(cd)) {
             goto bad_cd;
         }
 
@@ -489,10 +524,11 @@ static int decode_cd(SMMUTransCfg *cfg, CD *cd, SMMUEventInfo *event)
         if (tt->ttb & ~(MAKE_64BIT_MASK(0, cfg->oas))) {
             goto bad_cd;
         }
-        trace_smmuv3_decode_cd_tt(i, tt->tsz, tt->ttb, tt->granule_sz);
+        tt->had = CD_HAD(cd, i);
+        trace_smmuv3_decode_cd_tt(i, tt->tsz, tt->ttb, tt->granule_sz, tt->had);
     }
 
-    event->record_trans_faults = CD_R(cd);
+    cfg->record_faults = CD_R(cd);
 
     return 0;
 
@@ -509,7 +545,7 @@ bad_cd:
  *       the different configuration decoding steps
  * @event: must be zero'ed by the caller
  *
- * return < 0 if the translation needs to be aborted (@event is filled
+ * return < 0 in case of config decoding error (@event is filled
  * accordingly). Return 0 otherwise.
  */
 static int smmuv3_decode_config(IOMMUMemoryRegion *mr, SMMUTransCfg *cfg,
@@ -518,23 +554,82 @@ static int smmuv3_decode_config(IOMMUMemoryRegion *mr, SMMUTransCfg *cfg,
     SMMUDevice *sdev = container_of(mr, SMMUDevice, iommu);
     uint32_t sid = smmu_get_sid(sdev);
     SMMUv3State *s = sdev->smmu;
-    int ret = -EINVAL;
+    int ret;
     STE ste;
     CD cd;
 
-    if (smmu_find_ste(s, sid, &ste, event)) {
+    ret = smmu_find_ste(s, sid, &ste, event);
+    if (ret) {
         return ret;
     }
 
-    if (decode_ste(s, cfg, &ste, event)) {
+    ret = decode_ste(s, cfg, &ste, event);
+    if (ret) {
         return ret;
     }
 
-    if (smmu_get_cd(s, &ste, 0 /* ssid */, &cd, event)) {
+    if (cfg->aborted || cfg->bypassed) {
+        return 0;
+    }
+
+    ret = smmu_get_cd(s, &ste, 0 /* ssid */, &cd, event);
+    if (ret) {
         return ret;
     }
 
     return decode_cd(cfg, &cd, event);
+}
+
+/**
+ * smmuv3_get_config - Look up for a cached copy of configuration data for
+ * @sdev and on cache miss performs a configuration structure decoding from
+ * guest RAM.
+ *
+ * @sdev: SMMUDevice handle
+ * @event: output event info
+ *
+ * The configuration cache contains data resulting from both STE and CD
+ * decoding under the form of an SMMUTransCfg struct. The hash table is indexed
+ * by the SMMUDevice handle.
+ */
+static SMMUTransCfg *smmuv3_get_config(SMMUDevice *sdev, SMMUEventInfo *event)
+{
+    SMMUv3State *s = sdev->smmu;
+    SMMUState *bc = &s->smmu_state;
+    SMMUTransCfg *cfg;
+
+    cfg = g_hash_table_lookup(bc->configs, sdev);
+    if (cfg) {
+        sdev->cfg_cache_hits++;
+        trace_smmuv3_config_cache_hit(smmu_get_sid(sdev),
+                            sdev->cfg_cache_hits, sdev->cfg_cache_misses,
+                            100 * sdev->cfg_cache_hits /
+                            (sdev->cfg_cache_hits + sdev->cfg_cache_misses));
+    } else {
+        sdev->cfg_cache_misses++;
+        trace_smmuv3_config_cache_miss(smmu_get_sid(sdev),
+                            sdev->cfg_cache_hits, sdev->cfg_cache_misses,
+                            100 * sdev->cfg_cache_hits /
+                            (sdev->cfg_cache_hits + sdev->cfg_cache_misses));
+        cfg = g_new0(SMMUTransCfg, 1);
+
+        if (!smmuv3_decode_config(&sdev->iommu, cfg, event)) {
+            g_hash_table_insert(bc->configs, sdev, cfg);
+        } else {
+            g_free(cfg);
+            cfg = NULL;
+        }
+    }
+    return cfg;
+}
+
+static void smmuv3_flush_config(SMMUDevice *sdev)
+{
+    SMMUv3State *s = sdev->smmu;
+    SMMUState *bc = &s->smmu_state;
+
+    trace_smmuv3_config_cache_inv(smmu_get_sid(sdev));
+    g_hash_table_remove(bc->configs, sdev);
 }
 
 static IOMMUTLBEntry smmuv3_translate(IOMMUMemoryRegion *mr, hwaddr addr,
@@ -543,9 +638,16 @@ static IOMMUTLBEntry smmuv3_translate(IOMMUMemoryRegion *mr, hwaddr addr,
     SMMUDevice *sdev = container_of(mr, SMMUDevice, iommu);
     SMMUv3State *s = sdev->smmu;
     uint32_t sid = smmu_get_sid(sdev);
-    SMMUEventInfo event = {.type = SMMU_EVT_OK, .sid = sid};
+    SMMUEventInfo event = {.type = SMMU_EVT_NONE,
+                           .sid = sid,
+                           .inval_ste_allowed = false};
     SMMUPTWEventInfo ptw_info = {};
-    SMMUTransCfg cfg = {};
+    SMMUTranslationStatus status;
+    SMMUState *bs = ARM_SMMU(s);
+    uint64_t page_mask, aligned_addr;
+    SMMUTLBEntry *cached_entry = NULL;
+    SMMUTransTableInfo *tt;
+    SMMUTransCfg *cfg = NULL;
     IOMMUTLBEntry entry = {
         .target_as = &address_space_memory,
         .iova = addr,
@@ -553,23 +655,63 @@ static IOMMUTLBEntry smmuv3_translate(IOMMUMemoryRegion *mr, hwaddr addr,
         .addr_mask = ~(hwaddr)0,
         .perm = IOMMU_NONE,
     };
-    int ret = 0;
+
+    qemu_mutex_lock(&s->mutex);
 
     if (!smmu_enabled(s)) {
-        goto out;
+        status = SMMU_TRANS_DISABLE;
+        goto epilogue;
     }
 
-    ret = smmuv3_decode_config(mr, &cfg, &event);
-    if (ret) {
-        goto out;
+    cfg = smmuv3_get_config(sdev, &event);
+    if (!cfg) {
+        status = SMMU_TRANS_ERROR;
+        goto epilogue;
     }
 
-    if (cfg.aborted) {
-        goto out;
+    if (cfg->aborted) {
+        status = SMMU_TRANS_ABORT;
+        goto epilogue;
     }
 
-    ret = smmu_ptw(&cfg, addr, flag, &entry, &ptw_info);
-    if (ret) {
+    if (cfg->bypassed) {
+        status = SMMU_TRANS_BYPASS;
+        goto epilogue;
+    }
+
+    tt = select_tt(cfg, addr);
+    if (!tt) {
+        if (cfg->record_faults) {
+            event.type = SMMU_EVT_F_TRANSLATION;
+            event.u.f_translation.addr = addr;
+            event.u.f_translation.rnw = flag & 0x1;
+        }
+        status = SMMU_TRANS_ERROR;
+        goto epilogue;
+    }
+
+    page_mask = (1ULL << (tt->granule_sz)) - 1;
+    aligned_addr = addr & ~page_mask;
+
+    cached_entry = smmu_iotlb_lookup(bs, cfg, tt, aligned_addr);
+    if (cached_entry) {
+        if ((flag & IOMMU_WO) && !(cached_entry->entry.perm & IOMMU_WO)) {
+            status = SMMU_TRANS_ERROR;
+            if (cfg->record_faults) {
+                event.type = SMMU_EVT_F_PERMISSION;
+                event.u.f_permission.addr = addr;
+                event.u.f_permission.rnw = flag & 0x1;
+            }
+        } else {
+            status = SMMU_TRANS_SUCCESS;
+        }
+        goto epilogue;
+    }
+
+    cached_entry = g_new0(SMMUTLBEntry, 1);
+
+    if (smmu_ptw(cfg, aligned_addr, flag, cached_entry, &ptw_info)) {
+        g_free(cached_entry);
         switch (ptw_info.type) {
         case SMMU_PTW_ERR_WALK_EABT:
             event.type = SMMU_EVT_F_WALK_EABT;
@@ -579,28 +721,28 @@ static IOMMUTLBEntry smmuv3_translate(IOMMUMemoryRegion *mr, hwaddr addr,
             event.u.f_walk_eabt.addr2 = ptw_info.addr;
             break;
         case SMMU_PTW_ERR_TRANSLATION:
-            if (event.record_trans_faults) {
+            if (cfg->record_faults) {
                 event.type = SMMU_EVT_F_TRANSLATION;
                 event.u.f_translation.addr = addr;
                 event.u.f_translation.rnw = flag & 0x1;
             }
             break;
         case SMMU_PTW_ERR_ADDR_SIZE:
-            if (event.record_trans_faults) {
+            if (cfg->record_faults) {
                 event.type = SMMU_EVT_F_ADDR_SIZE;
                 event.u.f_addr_size.addr = addr;
                 event.u.f_addr_size.rnw = flag & 0x1;
             }
             break;
         case SMMU_PTW_ERR_ACCESS:
-            if (event.record_trans_faults) {
+            if (cfg->record_faults) {
                 event.type = SMMU_EVT_F_ACCESS;
                 event.u.f_access.addr = addr;
                 event.u.f_access.rnw = flag & 0x1;
             }
             break;
         case SMMU_PTW_ERR_PERMISSION:
-            if (event.record_trans_faults) {
+            if (cfg->record_faults) {
                 event.type = SMMU_EVT_F_PERMISSION;
                 event.u.f_permission.addr = addr;
                 event.u.f_permission.rnw = flag & 0x1;
@@ -609,25 +751,182 @@ static IOMMUTLBEntry smmuv3_translate(IOMMUMemoryRegion *mr, hwaddr addr,
         default:
             g_assert_not_reached();
         }
+        status = SMMU_TRANS_ERROR;
+    } else {
+        smmu_iotlb_insert(bs, cfg, cached_entry);
+        status = SMMU_TRANS_SUCCESS;
     }
-out:
-    if (ret) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "%s translation failed for iova=0x%"PRIx64"(%d)\n",
-                      mr->parent_obj.name, addr, ret);
-        entry.perm = IOMMU_NONE;
-        smmuv3_record_event(s, &event);
-    } else if (!cfg.aborted) {
+
+epilogue:
+    qemu_mutex_unlock(&s->mutex);
+    switch (status) {
+    case SMMU_TRANS_SUCCESS:
+        entry.perm = cached_entry->entry.perm;
+        entry.translated_addr = cached_entry->entry.translated_addr +
+                                    (addr & cached_entry->entry.addr_mask);
+        entry.addr_mask = cached_entry->entry.addr_mask;
+        trace_smmuv3_translate_success(mr->parent_obj.name, sid, addr,
+                                       entry.translated_addr, entry.perm);
+        break;
+    case SMMU_TRANS_DISABLE:
         entry.perm = flag;
-        trace_smmuv3_translate(mr->parent_obj.name, sid, addr,
-                               entry.translated_addr, entry.perm);
+        entry.addr_mask = ~TARGET_PAGE_MASK;
+        trace_smmuv3_translate_disable(mr->parent_obj.name, sid, addr,
+                                      entry.perm);
+        break;
+    case SMMU_TRANS_BYPASS:
+        entry.perm = flag;
+        entry.addr_mask = ~TARGET_PAGE_MASK;
+        trace_smmuv3_translate_bypass(mr->parent_obj.name, sid, addr,
+                                      entry.perm);
+        break;
+    case SMMU_TRANS_ABORT:
+        /* no event is recorded on abort */
+        trace_smmuv3_translate_abort(mr->parent_obj.name, sid, addr,
+                                     entry.perm);
+        break;
+    case SMMU_TRANS_ERROR:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s translation failed for iova=0x%"PRIx64" (%s)\n",
+                      mr->parent_obj.name, addr, smmu_event_string(event.type));
+        smmuv3_record_event(s, &event);
+        break;
     }
 
     return entry;
 }
 
+/**
+ * smmuv3_notify_iova - call the notifier @n for a given
+ * @asid and @iova tuple.
+ *
+ * @mr: IOMMU mr region handle
+ * @n: notifier to be called
+ * @asid: address space ID or negative value if we don't care
+ * @iova: iova
+ * @tg: translation granule (if communicated through range invalidation)
+ * @num_pages: number of @granule sized pages (if tg != 0), otherwise 1
+ */
+static void smmuv3_notify_iova(IOMMUMemoryRegion *mr,
+                               IOMMUNotifier *n,
+                               int asid, dma_addr_t iova,
+                               uint8_t tg, uint64_t num_pages)
+{
+    SMMUDevice *sdev = container_of(mr, SMMUDevice, iommu);
+    IOMMUTLBEvent event;
+    uint8_t granule;
+
+    if (!tg) {
+        SMMUEventInfo event = {.inval_ste_allowed = true};
+        SMMUTransCfg *cfg = smmuv3_get_config(sdev, &event);
+        SMMUTransTableInfo *tt;
+
+        if (!cfg) {
+            return;
+        }
+
+        if (asid >= 0 && cfg->asid != asid) {
+            return;
+        }
+
+        tt = select_tt(cfg, iova);
+        if (!tt) {
+            return;
+        }
+        granule = tt->granule_sz;
+    } else {
+        granule = tg * 2 + 10;
+    }
+
+    event.type = IOMMU_NOTIFIER_UNMAP;
+    event.entry.target_as = &address_space_memory;
+    event.entry.iova = iova;
+    event.entry.addr_mask = num_pages * (1 << granule) - 1;
+    event.entry.perm = IOMMU_NONE;
+
+    memory_region_notify_iommu_one(n, &event);
+}
+
+/* invalidate an asid/iova range tuple in all mr's */
+static void smmuv3_inv_notifiers_iova(SMMUState *s, int asid, dma_addr_t iova,
+                                      uint8_t tg, uint64_t num_pages)
+{
+    SMMUDevice *sdev;
+
+    QLIST_FOREACH(sdev, &s->devices_with_notifiers, next) {
+        IOMMUMemoryRegion *mr = &sdev->iommu;
+        IOMMUNotifier *n;
+
+        trace_smmuv3_inv_notifiers_iova(mr->parent_obj.name, asid, iova,
+                                        tg, num_pages);
+
+        IOMMU_NOTIFIER_FOREACH(n, mr) {
+            smmuv3_notify_iova(mr, n, asid, iova, tg, num_pages);
+        }
+    }
+}
+
+static void smmuv3_s1_range_inval(SMMUState *s, Cmd *cmd)
+{
+    dma_addr_t end, addr = CMD_ADDR(cmd);
+    uint8_t type = CMD_TYPE(cmd);
+    uint16_t vmid = CMD_VMID(cmd);
+    uint8_t scale = CMD_SCALE(cmd);
+    uint8_t num = CMD_NUM(cmd);
+    uint8_t ttl = CMD_TTL(cmd);
+    bool leaf = CMD_LEAF(cmd);
+    uint8_t tg = CMD_TG(cmd);
+    uint64_t num_pages;
+    uint8_t granule;
+    int asid = -1;
+
+    if (type == SMMU_CMD_TLBI_NH_VA) {
+        asid = CMD_ASID(cmd);
+    }
+
+    if (!tg) {
+        trace_smmuv3_s1_range_inval(vmid, asid, addr, tg, 1, ttl, leaf);
+        smmuv3_inv_notifiers_iova(s, asid, addr, tg, 1);
+        smmu_iotlb_inv_iova(s, asid, addr, tg, 1, ttl);
+        return;
+    }
+
+    /* RIL in use */
+
+    num_pages = (num + 1) * BIT_ULL(scale);
+    granule = tg * 2 + 10;
+
+    /* Split invalidations into ^2 range invalidations */
+    end = addr + (num_pages << granule) - 1;
+
+    while (addr != end + 1) {
+        uint64_t mask = dma_aligned_pow2_mask(addr, end, 64);
+
+        num_pages = (mask + 1) >> granule;
+        trace_smmuv3_s1_range_inval(vmid, asid, addr, tg, num_pages, ttl, leaf);
+        smmuv3_inv_notifiers_iova(s, asid, addr, tg, num_pages);
+        smmu_iotlb_inv_iova(s, asid, addr, tg, num_pages, ttl);
+        addr += mask + 1;
+    }
+}
+
+static gboolean
+smmuv3_invalidate_ste(gpointer key, gpointer value, gpointer user_data)
+{
+    SMMUDevice *sdev = (SMMUDevice *)key;
+    uint32_t sid = smmu_get_sid(sdev);
+    SMMUSIDRange *sid_range = (SMMUSIDRange *)user_data;
+
+    if (sid < sid_range->start || sid > sid_range->end) {
+        return false;
+    }
+    trace_smmuv3_config_cache_inv(sid);
+    return true;
+}
+
 static int smmuv3_cmdq_consume(SMMUv3State *s)
 {
+    SMMUState *bs = ARM_SMMU(s);
     SMMUCmdError cmd_error = SMMU_CERROR_NONE;
     SMMUQueue *q = &s->cmdq;
     SMMUCommandType type = 0;
@@ -662,6 +961,7 @@ static int smmuv3_cmdq_consume(SMMUv3State *s)
 
         trace_smmuv3_cmdq_opcode(smmu_cmd_string(type));
 
+        qemu_mutex_lock(&s->mutex);
         switch (type) {
         case SMMU_CMD_SYNC:
             if (CMD_SYNC_CS(&cmd) & CMD_SYNC_SIG_IRQ) {
@@ -670,14 +970,88 @@ static int smmuv3_cmdq_consume(SMMUv3State *s)
             break;
         case SMMU_CMD_PREFETCH_CONFIG:
         case SMMU_CMD_PREFETCH_ADDR:
+            break;
         case SMMU_CMD_CFGI_STE:
+        {
+            uint32_t sid = CMD_SID(&cmd);
+            IOMMUMemoryRegion *mr = smmu_iommu_mr(bs, sid);
+            SMMUDevice *sdev;
+
+            if (CMD_SSEC(&cmd)) {
+                cmd_error = SMMU_CERROR_ILL;
+                break;
+            }
+
+            if (!mr) {
+                break;
+            }
+
+            trace_smmuv3_cmdq_cfgi_ste(sid);
+            sdev = container_of(mr, SMMUDevice, iommu);
+            smmuv3_flush_config(sdev);
+
+            break;
+        }
         case SMMU_CMD_CFGI_STE_RANGE: /* same as SMMU_CMD_CFGI_ALL */
+        {
+            uint32_t sid = CMD_SID(&cmd), mask;
+            uint8_t range = CMD_STE_RANGE(&cmd);
+            SMMUSIDRange sid_range;
+
+            if (CMD_SSEC(&cmd)) {
+                cmd_error = SMMU_CERROR_ILL;
+                break;
+            }
+
+            mask = (1ULL << (range + 1)) - 1;
+            sid_range.start = sid & ~mask;
+            sid_range.end = sid_range.start + mask;
+
+            trace_smmuv3_cmdq_cfgi_ste_range(sid_range.start, sid_range.end);
+            g_hash_table_foreach_remove(bs->configs, smmuv3_invalidate_ste,
+                                        &sid_range);
+            break;
+        }
         case SMMU_CMD_CFGI_CD:
         case SMMU_CMD_CFGI_CD_ALL:
-        case SMMU_CMD_TLBI_NH_ALL:
+        {
+            uint32_t sid = CMD_SID(&cmd);
+            IOMMUMemoryRegion *mr = smmu_iommu_mr(bs, sid);
+            SMMUDevice *sdev;
+
+            if (CMD_SSEC(&cmd)) {
+                cmd_error = SMMU_CERROR_ILL;
+                break;
+            }
+
+            if (!mr) {
+                break;
+            }
+
+            trace_smmuv3_cmdq_cfgi_cd(sid);
+            sdev = container_of(mr, SMMUDevice, iommu);
+            smmuv3_flush_config(sdev);
+            break;
+        }
         case SMMU_CMD_TLBI_NH_ASID:
-        case SMMU_CMD_TLBI_NH_VA:
+        {
+            uint16_t asid = CMD_ASID(&cmd);
+
+            trace_smmuv3_cmdq_tlbi_nh_asid(asid);
+            smmu_inv_notifiers_all(&s->smmu_state);
+            smmu_iotlb_inv_asid(bs, asid);
+            break;
+        }
+        case SMMU_CMD_TLBI_NH_ALL:
+        case SMMU_CMD_TLBI_NSNH_ALL:
+            trace_smmuv3_cmdq_tlbi_nh();
+            smmu_inv_notifiers_all(&s->smmu_state);
+            smmu_iotlb_inv_all(bs);
+            break;
         case SMMU_CMD_TLBI_NH_VAA:
+        case SMMU_CMD_TLBI_NH_VA:
+            smmuv3_s1_range_inval(bs, &cmd);
+            break;
         case SMMU_CMD_TLBI_EL3_ALL:
         case SMMU_CMD_TLBI_EL3_VA:
         case SMMU_CMD_TLBI_EL2_ALL:
@@ -686,7 +1060,6 @@ static int smmuv3_cmdq_consume(SMMUv3State *s)
         case SMMU_CMD_TLBI_EL2_VAA:
         case SMMU_CMD_TLBI_S12_VMALL:
         case SMMU_CMD_TLBI_S2_IPA:
-        case SMMU_CMD_TLBI_NSNH_ALL:
         case SMMU_CMD_ATC_INV:
         case SMMU_CMD_PRI_RESP:
         case SMMU_CMD_RESUME:
@@ -699,6 +1072,7 @@ static int smmuv3_cmdq_consume(SMMUv3State *s)
                           "Illegal command type: %d\n", CMD_TYPE(&cmd));
             break;
         }
+        qemu_mutex_unlock(&s->mutex);
         if (cmd_error) {
             break;
         }
@@ -917,7 +1291,7 @@ static MemTxResult smmu_readl(SMMUv3State *s, hwaddr offset,
                               uint64_t *data, MemTxAttrs attrs)
 {
     switch (offset) {
-    case A_IDREGS ... A_IDREGS + 0x1f:
+    case A_IDREGS ... A_IDREGS + 0x2f:
         *data = smmuv3_idreg(offset - A_IDREGS);
         return MEMTX_OK;
     case A_IDR0 ... A_IDR5:
@@ -925,6 +1299,9 @@ static MemTxResult smmu_readl(SMMUv3State *s, hwaddr offset,
         return MEMTX_OK;
     case A_IIDR:
         *data = s->iidr;
+        return MEMTX_OK;
+    case A_AIDR:
+        *data = s->aidr;
         return MEMTX_OK;
     case A_CR0:
         *data = s->cr[0];
@@ -1078,6 +1455,8 @@ static void smmu_realize(DeviceState *d, Error **errp)
         return;
     }
 
+    qemu_mutex_init(&s->mutex);
+
     memory_region_init_io(&sys->iomem, OBJECT(s),
                           &smmu_mem_ops, sys, TYPE_ARM_SMMUV3, 0x20000);
 
@@ -1097,6 +1476,7 @@ static const VMStateDescription vmstate_smmuv3_queue = {
         VMSTATE_UINT32(prod, SMMUQueue),
         VMSTATE_UINT32(cons, SMMUQueue),
         VMSTATE_UINT8(log2size, SMMUQueue),
+        VMSTATE_END_OF_LIST(),
     },
 };
 
@@ -1104,6 +1484,7 @@ static const VMStateDescription vmstate_smmuv3 = {
     .name = "smmuv3",
     .version_id = 1,
     .minimum_version_id = 1,
+    .priority = MIG_PRI_IOMMU,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(features, SMMUv3State),
         VMSTATE_UINT8(sid_size, SMMUv3State),
@@ -1147,14 +1528,36 @@ static void smmuv3_class_init(ObjectClass *klass, void *data)
     dc->realize = smmu_realize;
 }
 
-static void smmuv3_notify_flag_changed(IOMMUMemoryRegion *iommu,
-                                       IOMMUNotifierFlag old,
-                                       IOMMUNotifierFlag new)
+static int smmuv3_notify_flag_changed(IOMMUMemoryRegion *iommu,
+                                      IOMMUNotifierFlag old,
+                                      IOMMUNotifierFlag new,
+                                      Error **errp)
 {
-    if (old == IOMMU_NOTIFIER_NONE) {
-        warn_report("SMMUV3 does not support vhost/vfio integration yet: "
-                    "devices of those types will not function properly");
+    SMMUDevice *sdev = container_of(iommu, SMMUDevice, iommu);
+    SMMUv3State *s3 = sdev->smmu;
+    SMMUState *s = &(s3->smmu_state);
+
+    if (new & IOMMU_NOTIFIER_DEVIOTLB_UNMAP) {
+        error_setg(errp, "SMMUv3 does not support dev-iotlb yet");
+        return -EINVAL;
     }
+
+    if (new & IOMMU_NOTIFIER_MAP) {
+        error_setg(errp,
+                   "device %02x.%02x.%x requires iommu MAP notifier which is "
+                   "not currently supported", pci_bus_num(sdev->bus),
+                   PCI_SLOT(sdev->devfn), PCI_FUNC(sdev->devfn));
+        return -EINVAL;
+    }
+
+    if (old == IOMMU_NOTIFIER_NONE) {
+        trace_smmuv3_notify_flag_add(iommu->parent_obj.name);
+        QLIST_INSERT_HEAD(&s->devices_with_notifiers, sdev, next);
+    } else if (new == IOMMU_NOTIFIER_NONE) {
+        trace_smmuv3_notify_flag_del(iommu->parent_obj.name);
+        QLIST_REMOVE(sdev, next);
+    }
+    return 0;
 }
 
 static void smmuv3_iommu_memory_region_class_init(ObjectClass *klass,

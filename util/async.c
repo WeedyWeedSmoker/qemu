@@ -25,49 +25,100 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "qemu-common.h"
 #include "block/aio.h"
 #include "block/thread-pool.h"
 #include "qemu/main-loop.h"
 #include "qemu/atomic.h"
+#include "qemu/rcu_queue.h"
 #include "block/raw-aio.h"
 #include "qemu/coroutine_int.h"
+#include "qemu/coroutine-tls.h"
+#include "sysemu/cpu-timers.h"
 #include "trace.h"
 
 /***********************************************************/
 /* bottom halves (can be seen as timers which expire ASAP) */
 
-struct QEMUBH {
-    AioContext *ctx;
-    QEMUBHFunc *cb;
-    void *opaque;
-    QEMUBH *next;
-    bool scheduled;
-    bool idle;
-    bool deleted;
+/* QEMUBH::flags values */
+enum {
+    /* Already enqueued and waiting for aio_bh_poll() */
+    BH_PENDING   = (1 << 0),
+
+    /* Invoke the callback */
+    BH_SCHEDULED = (1 << 1),
+
+    /* Delete without invoking callback */
+    BH_DELETED   = (1 << 2),
+
+    /* Delete after invoking callback */
+    BH_ONESHOT   = (1 << 3),
+
+    /* Schedule periodically when the event loop is idle */
+    BH_IDLE      = (1 << 4),
 };
 
-void aio_bh_schedule_oneshot(AioContext *ctx, QEMUBHFunc *cb, void *opaque)
+struct QEMUBH {
+    AioContext *ctx;
+    const char *name;
+    QEMUBHFunc *cb;
+    void *opaque;
+    QSLIST_ENTRY(QEMUBH) next;
+    unsigned flags;
+};
+
+/* Called concurrently from any thread */
+static void aio_bh_enqueue(QEMUBH *bh, unsigned new_flags)
 {
-    QEMUBH *bh;
-    bh = g_new(QEMUBH, 1);
-    *bh = (QEMUBH){
-        .ctx = ctx,
-        .cb = cb,
-        .opaque = opaque,
-    };
-    qemu_lockcnt_lock(&ctx->list_lock);
-    bh->next = ctx->first_bh;
-    bh->scheduled = 1;
-    bh->deleted = 1;
-    /* Make sure that the members are ready before putting bh into list */
-    smp_wmb();
-    ctx->first_bh = bh;
-    qemu_lockcnt_unlock(&ctx->list_lock);
+    AioContext *ctx = bh->ctx;
+    unsigned old_flags;
+
+    /*
+     * The memory barrier implicit in qatomic_fetch_or makes sure that:
+     * 1. idle & any writes needed by the callback are done before the
+     *    locations are read in the aio_bh_poll.
+     * 2. ctx is loaded before the callback has a chance to execute and bh
+     *    could be freed.
+     */
+    old_flags = qatomic_fetch_or(&bh->flags, BH_PENDING | new_flags);
+    if (!(old_flags & BH_PENDING)) {
+        QSLIST_INSERT_HEAD_ATOMIC(&ctx->bh_list, bh, next);
+    }
+
     aio_notify(ctx);
+    /*
+     * Workaround for record/replay.
+     * vCPU execution should be suspended when new BH is set.
+     * This is needed to avoid guest timeouts caused
+     * by the long cycles of the execution.
+     */
+    icount_notify_exit();
 }
 
-QEMUBH *aio_bh_new(AioContext *ctx, QEMUBHFunc *cb, void *opaque)
+/* Only called from aio_bh_poll() and aio_ctx_finalize() */
+static QEMUBH *aio_bh_dequeue(BHList *head, unsigned *flags)
+{
+    QEMUBH *bh = QSLIST_FIRST_RCU(head);
+
+    if (!bh) {
+        return NULL;
+    }
+
+    QSLIST_REMOVE_HEAD(head, next);
+
+    /*
+     * The qatomic_and is paired with aio_bh_enqueue().  The implicit memory
+     * barrier ensures that the callback sees all writes done by the scheduling
+     * thread.  It also ensures that the scheduling thread sees the cleared
+     * flag before bh->cb has run, and thus will call aio_notify again if
+     * necessary.
+     */
+    *flags = qatomic_fetch_and(&bh->flags,
+                              ~(BH_PENDING | BH_SCHEDULED | BH_IDLE));
+    return bh;
+}
+
+void aio_bh_schedule_oneshot_full(AioContext *ctx, QEMUBHFunc *cb,
+                                  void *opaque, const char *name)
 {
     QEMUBH *bh;
     bh = g_new(QEMUBH, 1);
@@ -75,13 +126,22 @@ QEMUBH *aio_bh_new(AioContext *ctx, QEMUBHFunc *cb, void *opaque)
         .ctx = ctx,
         .cb = cb,
         .opaque = opaque,
+        .name = name,
     };
-    qemu_lockcnt_lock(&ctx->list_lock);
-    bh->next = ctx->first_bh;
-    /* Make sure that the members are ready before putting bh into list */
-    smp_wmb();
-    ctx->first_bh = bh;
-    qemu_lockcnt_unlock(&ctx->list_lock);
+    aio_bh_enqueue(bh, BH_SCHEDULED | BH_ONESHOT);
+}
+
+QEMUBH *aio_bh_new_full(AioContext *ctx, QEMUBHFunc *cb, void *opaque,
+                        const char *name)
+{
+    QEMUBH *bh;
+    bh = g_new(QEMUBH, 1);
+    *bh = (QEMUBH){
+        .ctx = ctx,
+        .cb = cb,
+        .opaque = opaque,
+        .name = name,
+    };
     return bh;
 }
 
@@ -90,91 +150,56 @@ void aio_bh_call(QEMUBH *bh)
     bh->cb(bh->opaque);
 }
 
-/* Multiple occurrences of aio_bh_poll cannot be called concurrently.
- * The count in ctx->list_lock is incremented before the call, and is
- * not affected by the call.
- */
+/* Multiple occurrences of aio_bh_poll cannot be called concurrently. */
 int aio_bh_poll(AioContext *ctx)
 {
-    QEMUBH *bh, **bhp, *next;
-    int ret;
-    bool deleted = false;
+    BHListSlice slice;
+    BHListSlice *s;
+    int ret = 0;
 
-    ret = 0;
-    for (bh = atomic_rcu_read(&ctx->first_bh); bh; bh = next) {
-        next = atomic_rcu_read(&bh->next);
-        /* The atomic_xchg is paired with the one in qemu_bh_schedule.  The
-         * implicit memory barrier ensures that the callback sees all writes
-         * done by the scheduling thread.  It also ensures that the scheduling
-         * thread sees the zero before bh->cb has run, and thus will call
-         * aio_notify again if necessary.
-         */
-        if (atomic_xchg(&bh->scheduled, 0)) {
+    QSLIST_MOVE_ATOMIC(&slice.bh_list, &ctx->bh_list);
+    QSIMPLEQ_INSERT_TAIL(&ctx->bh_slice_list, &slice, next);
+
+    while ((s = QSIMPLEQ_FIRST(&ctx->bh_slice_list))) {
+        QEMUBH *bh;
+        unsigned flags;
+
+        bh = aio_bh_dequeue(&s->bh_list, &flags);
+        if (!bh) {
+            QSIMPLEQ_REMOVE_HEAD(&ctx->bh_slice_list, next);
+            continue;
+        }
+
+        if ((flags & (BH_SCHEDULED | BH_DELETED)) == BH_SCHEDULED) {
             /* Idle BHs don't count as progress */
-            if (!bh->idle) {
+            if (!(flags & BH_IDLE)) {
                 ret = 1;
             }
-            bh->idle = 0;
             aio_bh_call(bh);
         }
-        if (bh->deleted) {
-            deleted = true;
+        if (flags & (BH_DELETED | BH_ONESHOT)) {
+            g_free(bh);
         }
     }
 
-    /* remove deleted bhs */
-    if (!deleted) {
-        return ret;
-    }
-
-    if (qemu_lockcnt_dec_if_lock(&ctx->list_lock)) {
-        bhp = &ctx->first_bh;
-        while (*bhp) {
-            bh = *bhp;
-            if (bh->deleted && !bh->scheduled) {
-                *bhp = bh->next;
-                g_free(bh);
-            } else {
-                bhp = &bh->next;
-            }
-        }
-        qemu_lockcnt_inc_and_unlock(&ctx->list_lock);
-    }
     return ret;
 }
 
 void qemu_bh_schedule_idle(QEMUBH *bh)
 {
-    bh->idle = 1;
-    /* Make sure that idle & any writes needed by the callback are done
-     * before the locations are read in the aio_bh_poll.
-     */
-    atomic_mb_set(&bh->scheduled, 1);
+    aio_bh_enqueue(bh, BH_SCHEDULED | BH_IDLE);
 }
 
 void qemu_bh_schedule(QEMUBH *bh)
 {
-    AioContext *ctx;
-
-    ctx = bh->ctx;
-    bh->idle = 0;
-    /* The memory barrier implicit in atomic_xchg makes sure that:
-     * 1. idle & any writes needed by the callback are done before the
-     *    locations are read in the aio_bh_poll.
-     * 2. ctx is loaded before scheduled is set and the callback has a chance
-     *    to execute.
-     */
-    if (atomic_xchg(&bh->scheduled, 1) == 0) {
-        aio_notify(ctx);
-    }
+    aio_bh_enqueue(bh, BH_SCHEDULED);
 }
-
 
 /* This func is async.
  */
 void qemu_bh_cancel(QEMUBH *bh)
 {
-    atomic_mb_set(&bh->scheduled, 0);
+    qatomic_and(&bh->flags, ~BH_SCHEDULED);
 }
 
 /* This func is async.The bottom half will do the delete action at the finial
@@ -182,21 +207,16 @@ void qemu_bh_cancel(QEMUBH *bh)
  */
 void qemu_bh_delete(QEMUBH *bh)
 {
-    bh->scheduled = 0;
-    bh->deleted = 1;
+    aio_bh_enqueue(bh, BH_DELETED);
 }
 
-int64_t
-aio_compute_timeout(AioContext *ctx)
+static int64_t aio_compute_bh_timeout(BHList *head, int timeout)
 {
-    int64_t deadline;
-    int timeout = -1;
     QEMUBH *bh;
 
-    for (bh = atomic_rcu_read(&ctx->first_bh); bh;
-         bh = atomic_rcu_read(&bh->next)) {
-        if (bh->scheduled) {
-            if (bh->idle) {
+    QSLIST_FOREACH_RCU(bh, head, next) {
+        if ((bh->flags & (BH_SCHEDULED | BH_DELETED)) == BH_SCHEDULED) {
+            if (bh->flags & BH_IDLE) {
                 /* idle bottom halves will be polled at least
                  * every 10ms */
                 timeout = 10000000;
@@ -205,6 +225,28 @@ aio_compute_timeout(AioContext *ctx)
                  * immediately */
                 return 0;
             }
+        }
+    }
+
+    return timeout;
+}
+
+int64_t
+aio_compute_timeout(AioContext *ctx)
+{
+    BHListSlice *s;
+    int64_t deadline;
+    int timeout = -1;
+
+    timeout = aio_compute_bh_timeout(&ctx->bh_list, timeout);
+    if (timeout == 0) {
+        return 0;
+    }
+
+    QSIMPLEQ_FOREACH(s, &ctx->bh_slice_list, next) {
+        timeout = aio_compute_bh_timeout(&s->bh_list, timeout);
+        if (timeout == 0) {
+            return 0;
         }
     }
 
@@ -221,7 +263,14 @@ aio_ctx_prepare(GSource *source, gint    *timeout)
 {
     AioContext *ctx = (AioContext *) source;
 
-    atomic_or(&ctx->notify_me, 1);
+    qatomic_set(&ctx->notify_me, qatomic_read(&ctx->notify_me) | 1);
+
+    /*
+     * Write ctx->notify_me before computing the timeout
+     * (reading bottom half flags, etc.).  Pairs with
+     * smp_mb in aio_notify().
+     */
+    smp_mb();
 
     /* We assume there is no timeout already supplied */
     *timeout = qemu_timeout_ns_to_ms(aio_compute_timeout(ctx));
@@ -238,13 +287,23 @@ aio_ctx_check(GSource *source)
 {
     AioContext *ctx = (AioContext *) source;
     QEMUBH *bh;
+    BHListSlice *s;
 
-    atomic_and(&ctx->notify_me, ~1);
+    /* Finish computing the timeout before clearing the flag.  */
+    qatomic_store_release(&ctx->notify_me, qatomic_read(&ctx->notify_me) & ~1);
     aio_notify_accept(ctx);
 
-    for (bh = ctx->first_bh; bh; bh = bh->next) {
-        if (bh->scheduled) {
+    QSLIST_FOREACH_RCU(bh, &ctx->bh_list, next) {
+        if ((bh->flags & (BH_SCHEDULED | BH_DELETED)) == BH_SCHEDULED) {
             return true;
+        }
+    }
+
+    QSIMPLEQ_FOREACH(s, &ctx->bh_slice_list, next) {
+        QSLIST_FOREACH_RCU(bh, &s->bh_list, next) {
+            if ((bh->flags & (BH_SCHEDULED | BH_DELETED)) == BH_SCHEDULED) {
+                return true;
+            }
         }
     }
     return aio_pending(ctx) || (timerlistgroup_deadline_ns(&ctx->tlg) == 0);
@@ -266,6 +325,8 @@ static void
 aio_ctx_finalize(GSource     *source)
 {
     AioContext *ctx = (AioContext *) source;
+    QEMUBH *bh;
+    unsigned flags;
 
     thread_pool_free(ctx->thread_pool);
 
@@ -277,23 +338,40 @@ aio_ctx_finalize(GSource     *source)
     }
 #endif
 
+#ifdef CONFIG_LINUX_IO_URING
+    if (ctx->linux_io_uring) {
+        luring_detach_aio_context(ctx->linux_io_uring, ctx);
+        luring_cleanup(ctx->linux_io_uring);
+        ctx->linux_io_uring = NULL;
+    }
+#endif
+
     assert(QSLIST_EMPTY(&ctx->scheduled_coroutines));
     qemu_bh_delete(ctx->co_schedule_bh);
 
-    qemu_lockcnt_lock(&ctx->list_lock);
-    assert(!qemu_lockcnt_count(&ctx->list_lock));
-    while (ctx->first_bh) {
-        QEMUBH *next = ctx->first_bh->next;
+    /* There must be no aio_bh_poll() calls going on */
+    assert(QSIMPLEQ_EMPTY(&ctx->bh_slice_list));
 
-        /* qemu_bh_delete() must have been called on BHs in this AioContext */
-        assert(ctx->first_bh->deleted);
+    while ((bh = aio_bh_dequeue(&ctx->bh_list, &flags))) {
+        /*
+         * qemu_bh_delete() must have been called on BHs in this AioContext. In
+         * many cases memory leaks, hangs, or inconsistent state occur when a
+         * BH is leaked because something still expects it to run.
+         *
+         * If you hit this, fix the lifecycle of the BH so that
+         * qemu_bh_delete() and any associated cleanup is called before the
+         * AioContext is finalized.
+         */
+        if (unlikely(!(flags & BH_DELETED))) {
+            fprintf(stderr, "%s: BH '%s' leaked, aborting...\n",
+                    __func__, bh->name);
+            abort();
+        }
 
-        g_free(ctx->first_bh);
-        ctx->first_bh = next;
+        g_free(bh);
     }
-    qemu_lockcnt_unlock(&ctx->list_lock);
 
-    aio_set_event_notifier(ctx, &ctx->notifier, false, NULL, NULL);
+    aio_set_event_notifier(ctx, &ctx->notifier, false, NULL, NULL, NULL);
     event_notifier_cleanup(&ctx->notifier);
     qemu_rec_mutex_destroy(&ctx->lock);
     qemu_lockcnt_destroy(&ctx->list_lock);
@@ -310,6 +388,7 @@ static GSourceFuncs aio_source_funcs = {
 
 GSource *aio_get_g_source(AioContext *ctx)
 {
+    aio_context_use_g_source(ctx);
     g_source_ref(&ctx->source);
     return &ctx->source;
 }
@@ -323,33 +402,75 @@ ThreadPool *aio_get_thread_pool(AioContext *ctx)
 }
 
 #ifdef CONFIG_LINUX_AIO
-LinuxAioState *aio_get_linux_aio(AioContext *ctx)
+LinuxAioState *aio_setup_linux_aio(AioContext *ctx, Error **errp)
 {
     if (!ctx->linux_aio) {
-        ctx->linux_aio = laio_init();
-        laio_attach_aio_context(ctx->linux_aio, ctx);
+        ctx->linux_aio = laio_init(errp);
+        if (ctx->linux_aio) {
+            laio_attach_aio_context(ctx->linux_aio, ctx);
+        }
     }
     return ctx->linux_aio;
+}
+
+LinuxAioState *aio_get_linux_aio(AioContext *ctx)
+{
+    assert(ctx->linux_aio);
+    return ctx->linux_aio;
+}
+#endif
+
+#ifdef CONFIG_LINUX_IO_URING
+LuringState *aio_setup_linux_io_uring(AioContext *ctx, Error **errp)
+{
+    if (ctx->linux_io_uring) {
+        return ctx->linux_io_uring;
+    }
+
+    ctx->linux_io_uring = luring_init(errp);
+    if (!ctx->linux_io_uring) {
+        return NULL;
+    }
+
+    luring_attach_aio_context(ctx->linux_io_uring, ctx);
+    return ctx->linux_io_uring;
+}
+
+LuringState *aio_get_linux_io_uring(AioContext *ctx)
+{
+    assert(ctx->linux_io_uring);
+    return ctx->linux_io_uring;
 }
 #endif
 
 void aio_notify(AioContext *ctx)
 {
-    /* Write e.g. bh->scheduled before reading ctx->notify_me.  Pairs
-     * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
+    /*
+     * Write e.g. bh->flags before writing ctx->notified.  Pairs with smp_mb in
+     * aio_notify_accept.
+     */
+    smp_wmb();
+    qatomic_set(&ctx->notified, true);
+
+    /*
+     * Write ctx->notified before reading ctx->notify_me.  Pairs
+     * with smp_mb in aio_ctx_prepare or aio_poll.
      */
     smp_mb();
-    if (ctx->notify_me) {
+    if (qatomic_read(&ctx->notify_me)) {
         event_notifier_set(&ctx->notifier);
-        atomic_mb_set(&ctx->notified, true);
     }
 }
 
 void aio_notify_accept(AioContext *ctx)
 {
-    if (atomic_xchg(&ctx->notified, false)) {
-        event_notifier_test_and_clear(&ctx->notifier);
-    }
+    qatomic_set(&ctx->notified, false);
+
+    /*
+     * Write ctx->notified before reading e.g. bh->flags.  Pairs with smp_wmb
+     * in aio_notify.
+     */
+    smp_mb();
 }
 
 static void aio_timerlist_notify(void *opaque, QEMUClockType type)
@@ -357,17 +478,25 @@ static void aio_timerlist_notify(void *opaque, QEMUClockType type)
     aio_notify(opaque);
 }
 
-static void event_notifier_dummy_cb(EventNotifier *e)
+static void aio_context_notifier_cb(EventNotifier *e)
 {
+    AioContext *ctx = container_of(e, AioContext, notifier);
+
+    event_notifier_test_and_clear(&ctx->notifier);
 }
 
 /* Returns true if aio_notify() was called (e.g. a BH was scheduled) */
-static bool event_notifier_poll(void *opaque)
+static bool aio_context_notifier_poll(void *opaque)
 {
     EventNotifier *e = opaque;
     AioContext *ctx = container_of(e, AioContext, notifier);
 
-    return atomic_read(&ctx->notified);
+    return qatomic_read(&ctx->notified);
+}
+
+static void aio_context_notifier_poll_ready(EventNotifier *e)
+{
+    /* Do nothing, we just wanted to kick the event loop */
 }
 
 static void co_schedule_bh_cb(void *opaque)
@@ -391,8 +520,8 @@ static void co_schedule_bh_cb(void *opaque)
         aio_context_acquire(ctx);
 
         /* Protected by write barrier in qemu_aio_coroutine_enter */
-        atomic_set(&co->scheduled, NULL);
-        qemu_coroutine_enter(co);
+        qatomic_set(&co->scheduled, NULL);
+        qemu_aio_coroutine_enter(ctx, co);
         aio_context_release(ctx);
     }
 }
@@ -403,6 +532,8 @@ AioContext *aio_context_new(Error **errp)
     AioContext *ctx;
 
     ctx = (AioContext *) g_source_new(&aio_source_funcs, sizeof(AioContext));
+    QSLIST_INIT(&ctx->bh_list);
+    QSIMPLEQ_INIT(&ctx->bh_slice_list);
     aio_context_setup(ctx);
 
     ret = event_notifier_init(&ctx->notifier, false);
@@ -418,12 +549,17 @@ AioContext *aio_context_new(Error **errp)
 
     aio_set_event_notifier(ctx, &ctx->notifier,
                            false,
-                           (EventNotifierHandler *)
-                           event_notifier_dummy_cb,
-                           event_notifier_poll);
+                           aio_context_notifier_cb,
+                           aio_context_notifier_poll,
+                           aio_context_notifier_poll_ready);
 #ifdef CONFIG_LINUX_AIO
     ctx->linux_aio = NULL;
 #endif
+
+#ifdef CONFIG_LINUX_IO_URING
+    ctx->linux_io_uring = NULL;
+#endif
+
     ctx->thread_pool = NULL;
     qemu_rec_mutex_init(&ctx->lock);
     timerlistgroup_init(&ctx->tlg, aio_timerlist_notify, ctx);
@@ -432,6 +568,11 @@ AioContext *aio_context_new(Error **errp)
     ctx->poll_max_ns = 0;
     ctx->poll_grow = 0;
     ctx->poll_shrink = 0;
+
+    ctx->aio_max_batch = 0;
+
+    ctx->thread_pool_min = 0;
+    ctx->thread_pool_max = THREAD_POOL_MAX_THREADS_DEFAULT;
 
     return ctx;
 fail:
@@ -442,7 +583,7 @@ fail:
 void aio_co_schedule(AioContext *ctx, Coroutine *co)
 {
     trace_aio_co_schedule(ctx, co);
-    const char *scheduled = atomic_cmpxchg(&co->scheduled, NULL,
+    const char *scheduled = qatomic_cmpxchg(&co->scheduled, NULL,
                                            __func__);
 
     if (scheduled) {
@@ -452,9 +593,47 @@ void aio_co_schedule(AioContext *ctx, Coroutine *co)
         abort();
     }
 
+    /* The coroutine might run and release the last ctx reference before we
+     * invoke qemu_bh_schedule().  Take a reference to keep ctx alive until
+     * we're done.
+     */
+    aio_context_ref(ctx);
+
     QSLIST_INSERT_HEAD_ATOMIC(&ctx->scheduled_coroutines,
                               co, co_scheduled_next);
     qemu_bh_schedule(ctx->co_schedule_bh);
+
+    aio_context_unref(ctx);
+}
+
+typedef struct AioCoRescheduleSelf {
+    Coroutine *co;
+    AioContext *new_ctx;
+} AioCoRescheduleSelf;
+
+static void aio_co_reschedule_self_bh(void *opaque)
+{
+    AioCoRescheduleSelf *data = opaque;
+    aio_co_schedule(data->new_ctx, data->co);
+}
+
+void coroutine_fn aio_co_reschedule_self(AioContext *new_ctx)
+{
+    AioContext *old_ctx = qemu_get_current_aio_context();
+
+    if (old_ctx != new_ctx) {
+        AioCoRescheduleSelf data = {
+            .co = qemu_coroutine_self(),
+            .new_ctx = new_ctx,
+        };
+        /*
+         * We can't directly schedule the coroutine in the target context
+         * because this would be racy: The other thread could try to enter the
+         * coroutine before it has yielded in this one.
+         */
+        aio_bh_schedule_oneshot(old_ctx, aio_co_reschedule_self_bh, &data);
+        qemu_coroutine_yield();
+    }
 }
 
 void aio_co_wake(struct Coroutine *co)
@@ -465,7 +644,7 @@ void aio_co_wake(struct Coroutine *co)
      * qemu_coroutine_enter.
      */
     smp_read_barrier_depends();
-    ctx = atomic_read(&co->ctx);
+    ctx = qatomic_read(&co->ctx);
 
     aio_co_enter(ctx, co);
 }
@@ -506,4 +685,42 @@ void aio_context_acquire(AioContext *ctx)
 void aio_context_release(AioContext *ctx)
 {
     qemu_rec_mutex_unlock(&ctx->lock);
+}
+
+QEMU_DEFINE_STATIC_CO_TLS(AioContext *, my_aiocontext)
+
+AioContext *qemu_get_current_aio_context(void)
+{
+    AioContext *ctx = get_my_aiocontext();
+    if (ctx) {
+        return ctx;
+    }
+    if (qemu_mutex_iothread_locked()) {
+        /* Possibly in a vCPU thread.  */
+        return qemu_get_aio_context();
+    }
+    return NULL;
+}
+
+void qemu_set_current_aio_context(AioContext *ctx)
+{
+    assert(!get_my_aiocontext());
+    set_my_aiocontext(ctx);
+}
+
+void aio_context_set_thread_pool_params(AioContext *ctx, int64_t min,
+                                        int64_t max, Error **errp)
+{
+
+    if (min > max || !max || min > INT_MAX || max > INT_MAX) {
+        error_setg(errp, "bad thread-pool-min/thread-pool-max values");
+        return;
+    }
+
+    ctx->thread_pool_min = min;
+    ctx->thread_pool_max = max;
+
+    if (ctx->thread_pool) {
+        thread_pool_update_params(ctx->thread_pool, ctx);
+    }
 }

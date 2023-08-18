@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Pretty-printer for simple trace backend binary trace files
 #
@@ -7,11 +7,9 @@
 # This work is licensed under the terms of the GNU GPL, version 2.  See
 # the COPYING file in the top-level directory.
 #
-# For help see docs/devel/tracing.txt
+# For help see docs/devel/tracing.rst
 
-from __future__ import print_function
 import struct
-import re
 import inspect
 from tracetool import read_events, Event
 from tracetool.backend.simple import is_string
@@ -70,7 +68,7 @@ def get_record(edict, idtoname, rechdr, fobj):
 def get_mapping(fobj):
     (event_id, ) = struct.unpack('=Q', fobj.read(8))
     (len, ) = struct.unpack('=L', fobj.read(4))
-    name = fobj.read(len)
+    name = fobj.read(len).decode()
 
     return (event_id, name)
 
@@ -176,7 +174,9 @@ def process(events, log, analyzer, read_header=True):
     if read_header:
         read_trace_header(log)
 
-    dropped_event = Event.build("Dropped_Event(uint64_t num_events_dropped)")
+    frameinfo = inspect.getframeinfo(inspect.currentframe())
+    dropped_event = Event.build("Dropped_Event(uint64_t num_events_dropped)",
+                                frameinfo.lineno + 1, frameinfo.filename)
     edict = {"dropped": dropped_event}
     idtoname = {dropped_event_id: "dropped"}
 

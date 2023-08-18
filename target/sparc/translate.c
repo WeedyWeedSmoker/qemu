@@ -7,7 +7,7 @@
    This library is free software; you can redistribute it and/or
    modify it under the terms of the GNU Lesser General Public
    License as published by the Free Software Foundation; either
-   version 2 of the License, or (at your option) any later version.
+   version 2.1 of the License, or (at your option) any later version.
 
    This library is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -24,12 +24,11 @@
 #include "disas/disas.h"
 #include "exec/helper-proto.h"
 #include "exec/exec-all.h"
-#include "tcg-op.h"
+#include "tcg/tcg-op.h"
 #include "exec/cpu_ldst.h"
 
 #include "exec/helper-gen.h"
 
-#include "trace-tcg.h"
 #include "exec/translator.h"
 #include "exec/log.h"
 #include "asi.h"
@@ -40,6 +39,8 @@
 #define DYNAMIC_PC  1 /* dynamic pc value */
 #define JUMP_PC     2 /* dynamic pc value which takes only two values
                          according to jump_pc[T2] */
+
+#define DISAS_EXIT  DISAS_TARGET_0
 
 /* global register indexes */
 static TCGv_ptr cpu_regwptr;
@@ -337,23 +338,14 @@ static inline TCGv gen_dest_gpr(DisasContext *dc, int reg)
     }
 }
 
-static inline bool use_goto_tb(DisasContext *s, target_ulong pc,
-                               target_ulong npc)
+static bool use_goto_tb(DisasContext *s, target_ulong pc, target_ulong npc)
 {
-    if (unlikely(s->base.singlestep_enabled || singlestep)) {
-        return false;
-    }
-
-#ifndef CONFIG_USER_ONLY
-    return (pc & TARGET_PAGE_MASK) == (s->base.tb->pc & TARGET_PAGE_MASK) &&
-           (npc & TARGET_PAGE_MASK) == (s->base.tb->pc & TARGET_PAGE_MASK);
-#else
-    return true;
-#endif
+    return translator_use_goto_tb(&s->base, pc) &&
+           translator_use_goto_tb(&s->base, npc);
 }
 
-static inline void gen_goto_tb(DisasContext *s, int tb_num,
-                               target_ulong pc, target_ulong npc)
+static void gen_goto_tb(DisasContext *s, int tb_num,
+                        target_ulong pc, target_ulong npc)
 {
     if (use_goto_tb(s, pc, npc))  {
         /* jump to same page: we can use a direct jump */
@@ -2017,7 +2009,7 @@ static inline void gen_ne_fop_QD(DisasContext *dc, int rd, int rs,
 }
 
 static void gen_swap(DisasContext *dc, TCGv dst, TCGv src,
-                     TCGv addr, int mmu_idx, TCGMemOp memop)
+                     TCGv addr, int mmu_idx, MemOp memop)
 {
     gen_address_mask(dc, addr);
     tcg_gen_atomic_xchg_tl(dst, addr, src, mmu_idx, memop);
@@ -2048,10 +2040,10 @@ typedef struct {
     ASIType type;
     int asi;
     int mem_idx;
-    TCGMemOp memop;
+    MemOp memop;
 } DisasASI;
 
-static DisasASI get_asi(DisasContext *dc, int insn, TCGMemOp memop)
+static DisasASI get_asi(DisasContext *dc, int insn, MemOp memop)
 {
     int asi = GET_FIELD(insn, 19, 26);
     ASIType type = GET_ASI_HELPER;
@@ -2265,7 +2257,7 @@ static DisasASI get_asi(DisasContext *dc, int insn, TCGMemOp memop)
 }
 
 static void gen_ld_asi(DisasContext *dc, TCGv dst, TCGv addr,
-                       int insn, TCGMemOp memop)
+                       int insn, MemOp memop)
 {
     DisasASI da = get_asi(dc, insn, memop);
 
@@ -2303,7 +2295,7 @@ static void gen_ld_asi(DisasContext *dc, TCGv dst, TCGv addr,
 }
 
 static void gen_st_asi(DisasContext *dc, TCGv src, TCGv addr,
-                       int insn, TCGMemOp memop)
+                       int insn, MemOp memop)
 {
     DisasASI da = get_asi(dc, insn, memop);
 
@@ -2322,8 +2314,8 @@ static void gen_st_asi(DisasContext *dc, TCGv src, TCGv addr,
         }
         /* in OpenSPARC T1+ CPUs TWINX ASIs in store instructions
          * are ST_BLKINIT_ ASIs */
-        /* fall through */
 #endif
+        /* fall through */
     case GET_ASI_DIRECT:
         gen_address_mask(dc, addr);
         tcg_gen_qemu_st_tl(src, addr, da.mem_idx, da.memop);
@@ -2472,7 +2464,7 @@ static void gen_ldstub_asi(DisasContext *dc, TCGv dst, TCGv addr, int insn)
 static void gen_ldf_asi(DisasContext *dc, TCGv addr,
                         int insn, int size, int rd)
 {
-    DisasASI da = get_asi(dc, insn, (size == 4 ? MO_TEUL : MO_TEQ));
+    DisasASI da = get_asi(dc, insn, (size == 4 ? MO_TEUL : MO_TEUQ));
     TCGv_i32 d32;
     TCGv_i64 d64;
 
@@ -2509,7 +2501,7 @@ static void gen_ldf_asi(DisasContext *dc, TCGv addr,
     case GET_ASI_BLOCK:
         /* Valid for lddfa on aligned registers only.  */
         if (size == 8 && (rd & 7) == 0) {
-            TCGMemOp memop;
+            MemOp memop;
             TCGv eight;
             int i;
 
@@ -2586,7 +2578,7 @@ static void gen_ldf_asi(DisasContext *dc, TCGv addr,
 static void gen_stf_asi(DisasContext *dc, TCGv addr,
                         int insn, int size, int rd)
 {
-    DisasASI da = get_asi(dc, insn, (size == 4 ? MO_TEUL : MO_TEQ));
+    DisasASI da = get_asi(dc, insn, (size == 4 ? MO_TEUL : MO_TEUQ));
     TCGv_i32 d32;
 
     switch (da.type) {
@@ -2623,7 +2615,7 @@ static void gen_stf_asi(DisasContext *dc, TCGv addr,
     case GET_ASI_BLOCK:
         /* Valid for stdfa on aligned registers only.  */
         if (size == 8 && (rd & 7) == 0) {
-            TCGMemOp memop;
+            MemOp memop;
             TCGv eight;
             int i;
 
@@ -2668,7 +2660,7 @@ static void gen_stf_asi(DisasContext *dc, TCGv addr,
 
 static void gen_ldda_asi(DisasContext *dc, TCGv addr, int insn, int rd)
 {
-    DisasASI da = get_asi(dc, insn, MO_TEQ);
+    DisasASI da = get_asi(dc, insn, MO_TEUQ);
     TCGv_i64 hi = gen_dest_gpr(dc, rd);
     TCGv_i64 lo = gen_dest_gpr(dc, rd + 1);
 
@@ -2735,7 +2727,7 @@ static void gen_ldda_asi(DisasContext *dc, TCGv addr, int insn, int rd)
 static void gen_stda_asi(DisasContext *dc, TCGv hi, TCGv addr,
                          int insn, int rd)
 {
-    DisasASI da = get_asi(dc, insn, MO_TEQ);
+    DisasASI da = get_asi(dc, insn, MO_TEUQ);
     TCGv lo = gen_load_gpr(dc, rd + 1);
 
     switch (da.type) {
@@ -2795,7 +2787,7 @@ static void gen_stda_asi(DisasContext *dc, TCGv hi, TCGv addr,
 static void gen_casx_asi(DisasContext *dc, TCGv addr, TCGv cmpv,
                          int insn, int rd)
 {
-    DisasASI da = get_asi(dc, insn, MO_TEQ);
+    DisasASI da = get_asi(dc, insn, MO_TEUQ);
     TCGv oldv;
 
     switch (da.type) {
@@ -2825,7 +2817,7 @@ static void gen_ldda_asi(DisasContext *dc, TCGv addr, int insn, int rd)
     TCGv lo = gen_dest_gpr(dc, rd | 1);
     TCGv hi = gen_dest_gpr(dc, rd);
     TCGv_i64 t64 = tcg_temp_new_i64();
-    DisasASI da = get_asi(dc, insn, MO_TEQ);
+    DisasASI da = get_asi(dc, insn, MO_TEUQ);
 
     switch (da.type) {
     case GET_ASI_EXCP:
@@ -2838,7 +2830,7 @@ static void gen_ldda_asi(DisasContext *dc, TCGv addr, int insn, int rd)
     default:
         {
             TCGv_i32 r_asi = tcg_const_i32(da.asi);
-            TCGv_i32 r_mop = tcg_const_i32(MO_Q);
+            TCGv_i32 r_mop = tcg_const_i32(MO_UQ);
 
             save_state(dc);
             gen_helper_ld_asi(t64, cpu_env, addr, r_asi, r_mop);
@@ -2857,7 +2849,7 @@ static void gen_ldda_asi(DisasContext *dc, TCGv addr, int insn, int rd)
 static void gen_stda_asi(DisasContext *dc, TCGv hi, TCGv addr,
                          int insn, int rd)
 {
-    DisasASI da = get_asi(dc, insn, MO_TEQ);
+    DisasASI da = get_asi(dc, insn, MO_TEUQ);
     TCGv lo = gen_load_gpr(dc, rd + 1);
     TCGv_i64 t64 = tcg_temp_new_i64();
 
@@ -2894,7 +2886,7 @@ static void gen_stda_asi(DisasContext *dc, TCGv hi, TCGv addr,
     default:
         {
             TCGv_i32 r_asi = tcg_const_i32(da.asi);
-            TCGv_i32 r_mop = tcg_const_i32(MO_Q);
+            TCGv_i32 r_mop = tcg_const_i32(MO_UQ);
 
             save_state(dc);
             gen_helper_st_asi(cpu_env, addr, t64, r_asi, r_mop);
@@ -3400,11 +3392,18 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                         r_const = tcg_const_i32(dc->mem_idx);
                         tcg_gen_ld_ptr(r_tickptr, cpu_env,
                                        offsetof(CPUSPARCState, tick));
+                        if (tb_cflags(dc->base.tb) & CF_USE_ICOUNT) {
+                            gen_io_start();
+                        }
                         gen_helper_tick_get_count(cpu_dst, cpu_env, r_tickptr,
                                                   r_const);
                         tcg_temp_free_ptr(r_tickptr);
                         tcg_temp_free_i32(r_const);
                         gen_store_gpr(dc, rd, cpu_dst);
+                        if (tb_cflags(dc->base.tb) & CF_USE_ICOUNT) {
+                            /* I/O operations in icount mode must end the TB */
+                            dc->base.is_jmp = DISAS_EXIT;
+                        }
                     }
                     break;
                 case 0x5: /* V9 rdpc */
@@ -3447,11 +3446,18 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                         r_const = tcg_const_i32(dc->mem_idx);
                         tcg_gen_ld_ptr(r_tickptr, cpu_env,
                                        offsetof(CPUSPARCState, stick));
+                        if (tb_cflags(dc->base.tb) & CF_USE_ICOUNT) {
+                            gen_io_start();
+                        }
                         gen_helper_tick_get_count(cpu_dst, cpu_env, r_tickptr,
                                                   r_const);
                         tcg_temp_free_ptr(r_tickptr);
                         tcg_temp_free_i32(r_const);
                         gen_store_gpr(dc, rd, cpu_dst);
+                        if (tb_cflags(dc->base.tb) & CF_USE_ICOUNT) {
+                            /* I/O operations in icount mode must end the TB */
+                            dc->base.is_jmp = DISAS_EXIT;
+                        }
                     }
                     break;
                 case 0x19: /* System tick compare */
@@ -3576,10 +3582,17 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                         r_const = tcg_const_i32(dc->mem_idx);
                         tcg_gen_ld_ptr(r_tickptr, cpu_env,
                                        offsetof(CPUSPARCState, tick));
+                        if (tb_cflags(dc->base.tb) & CF_USE_ICOUNT) {
+                            gen_io_start();
+                        }
                         gen_helper_tick_get_count(cpu_tmp0, cpu_env,
                                                   r_tickptr, r_const);
                         tcg_temp_free_ptr(r_tickptr);
                         tcg_temp_free_i32(r_const);
+                        if (tb_cflags(dc->base.tb) & CF_USE_ICOUNT) {
+                            /* I/O operations in icount mode must end the TB */
+                            dc->base.is_jmp = DISAS_EXIT;
+                        }
                     }
                     break;
                 case 5: // tba
@@ -3643,6 +3656,8 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
 #endif
                 gen_store_gpr(dc, rd, cpu_tmp0);
                 break;
+#endif
+#if defined(TARGET_SPARC64) || !defined(CONFIG_USER_ONLY)
             } else if (xop == 0x2b) { /* rdtbr / V9 flushw */
 #ifdef TARGET_SPARC64
                 gen_helper_flushw(cpu_env);
@@ -4385,9 +4400,15 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                                     r_tickptr = tcg_temp_new_ptr();
                                     tcg_gen_ld_ptr(r_tickptr, cpu_env,
                                                    offsetof(CPUSPARCState, tick));
+                                    if (tb_cflags(dc->base.tb) &
+                                           CF_USE_ICOUNT) {
+                                        gen_io_start();
+                                    }
                                     gen_helper_tick_set_limit(r_tickptr,
                                                               cpu_tick_cmpr);
                                     tcg_temp_free_ptr(r_tickptr);
+                                    /* End TB to handle timer interrupt */
+                                    dc->base.is_jmp = DISAS_EXIT;
                                 }
                                 break;
                             case 0x18: /* System tick */
@@ -4403,9 +4424,15 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                                     r_tickptr = tcg_temp_new_ptr();
                                     tcg_gen_ld_ptr(r_tickptr, cpu_env,
                                                    offsetof(CPUSPARCState, stick));
+                                    if (tb_cflags(dc->base.tb) &
+                                           CF_USE_ICOUNT) {
+                                        gen_io_start();
+                                    }
                                     gen_helper_tick_set_count(r_tickptr,
                                                               cpu_tmp0);
                                     tcg_temp_free_ptr(r_tickptr);
+                                    /* End TB to handle timer interrupt */
+                                    dc->base.is_jmp = DISAS_EXIT;
                                 }
                                 break;
                             case 0x19: /* System tick compare */
@@ -4421,9 +4448,15 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                                     r_tickptr = tcg_temp_new_ptr();
                                     tcg_gen_ld_ptr(r_tickptr, cpu_env,
                                                    offsetof(CPUSPARCState, stick));
+                                    if (tb_cflags(dc->base.tb) &
+                                           CF_USE_ICOUNT) {
+                                        gen_io_start();
+                                    }
                                     gen_helper_tick_set_limit(r_tickptr,
                                                               cpu_stick_cmpr);
                                     tcg_temp_free_ptr(r_tickptr);
+                                    /* End TB to handle timer interrupt */
+                                    dc->base.is_jmp = DISAS_EXIT;
                                 }
                                 break;
 
@@ -4531,9 +4564,15 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                                     r_tickptr = tcg_temp_new_ptr();
                                     tcg_gen_ld_ptr(r_tickptr, cpu_env,
                                                    offsetof(CPUSPARCState, tick));
+                                    if (tb_cflags(dc->base.tb) &
+                                           CF_USE_ICOUNT) {
+                                        gen_io_start();
+                                    }
                                     gen_helper_tick_set_count(r_tickptr,
                                                               cpu_tmp0);
                                     tcg_temp_free_ptr(r_tickptr);
+                                    /* End TB to handle timer interrupt */
+                                    dc->base.is_jmp = DISAS_EXIT;
                                 }
                                 break;
                             case 5: // tba
@@ -4541,7 +4580,14 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                                 break;
                             case 6: // pstate
                                 save_state(dc);
+                                if (tb_cflags(dc->base.tb) & CF_USE_ICOUNT) {
+                                    gen_io_start();
+                                }
                                 gen_helper_wrpstate(cpu_env, cpu_tmp0);
+                                if (tb_cflags(dc->base.tb) & CF_USE_ICOUNT) {
+                                    /* I/O ops in icount mode must end the TB */
+                                    dc->base.is_jmp = DISAS_EXIT;
+                                }
                                 dc->npc = DYNAMIC_PC;
                                 break;
                             case 7: // tl
@@ -4551,7 +4597,14 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                                 dc->npc = DYNAMIC_PC;
                                 break;
                             case 8: // pil
+                                if (tb_cflags(dc->base.tb) & CF_USE_ICOUNT) {
+                                    gen_io_start();
+                                }
                                 gen_helper_wrpil(cpu_env, cpu_tmp0);
+                                if (tb_cflags(dc->base.tb) & CF_USE_ICOUNT) {
+                                    /* I/O ops in icount mode must end the TB */
+                                    dc->base.is_jmp = DISAS_EXIT;
+                                }
                                 break;
                             case 9: // cwp
                                 gen_helper_wrcwp(cpu_env, cpu_tmp0);
@@ -4642,9 +4695,15 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                                     r_tickptr = tcg_temp_new_ptr();
                                     tcg_gen_ld_ptr(r_tickptr, cpu_env,
                                                    offsetof(CPUSPARCState, hstick));
+                                    if (tb_cflags(dc->base.tb) &
+                                           CF_USE_ICOUNT) {
+                                        gen_io_start();
+                                    }
                                     gen_helper_tick_set_limit(r_tickptr,
                                                               cpu_hstick_cmpr);
                                     tcg_temp_free_ptr(r_tickptr);
+                                    /* End TB to handle timer interrupt */
+                                    dc->base.is_jmp = DISAS_EXIT;
                                 }
                                 break;
                             case 6: // hver readonly
@@ -5265,6 +5324,9 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                                 goto priv_insn;
                             dc->npc = DYNAMIC_PC;
                             dc->pc = DYNAMIC_PC;
+                            if (tb_cflags(dc->base.tb) & CF_USE_ICOUNT) {
+                                gen_io_start();
+                            }
                             gen_helper_done(cpu_env);
                             goto jmp_insn;
                         case 1:
@@ -5272,6 +5334,9 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                                 goto priv_insn;
                             dc->npc = DYNAMIC_PC;
                             dc->pc = DYNAMIC_PC;
+                            if (tb_cflags(dc->base.tb) & CF_USE_ICOUNT) {
+                                gen_io_start();
+                            }
                             gen_helper_retry(cpu_env);
                             goto jmp_insn;
                         default:
@@ -5414,7 +5479,7 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                     gen_ld_asi(dc, cpu_val, cpu_addr, insn, MO_TESL);
                     break;
                 case 0x1b: /* V9 ldxa */
-                    gen_ld_asi(dc, cpu_val, cpu_addr, insn, MO_TEQ);
+                    gen_ld_asi(dc, cpu_val, cpu_addr, insn, MO_TEUQ);
                     break;
                 case 0x2d: /* V9 prefetch, no effect */
                     goto skip_move;
@@ -5468,7 +5533,7 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                     if (rd == 1) {
                         TCGv_i64 t64 = tcg_temp_new_i64();
                         tcg_gen_qemu_ld_i64(t64, cpu_addr,
-                                            dc->mem_idx, MO_TEQ);
+                                            dc->mem_idx, MO_TEUQ);
                         gen_helper_ldxfsr(cpu_fsr, cpu_env, cpu_fsr, t64);
                         tcg_temp_free_i64(t64);
                         break;
@@ -5484,11 +5549,11 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                     gen_address_mask(dc, cpu_addr);
                     cpu_src1_64 = tcg_temp_new_i64();
                     tcg_gen_qemu_ld_i64(cpu_src1_64, cpu_addr, dc->mem_idx,
-                                        MO_TEQ | MO_ALIGN_4);
+                                        MO_TEUQ | MO_ALIGN_4);
                     tcg_gen_addi_tl(cpu_addr, cpu_addr, 8);
                     cpu_src2_64 = tcg_temp_new_i64();
                     tcg_gen_qemu_ld_i64(cpu_src2_64, cpu_addr, dc->mem_idx,
-                                        MO_TEQ | MO_ALIGN_4);
+                                        MO_TEUQ | MO_ALIGN_4);
                     gen_store_fpr_Q(dc, rd, cpu_src1_64, cpu_src2_64);
                     tcg_temp_free_i64(cpu_src1_64);
                     tcg_temp_free_i64(cpu_src2_64);
@@ -5497,7 +5562,7 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                     gen_address_mask(dc, cpu_addr);
                     cpu_dst_64 = gen_dest_fpr_D(dc, rd);
                     tcg_gen_qemu_ld_i64(cpu_dst_64, cpu_addr, dc->mem_idx,
-                                        MO_TEQ | MO_ALIGN_4);
+                                        MO_TEUQ | MO_ALIGN_4);
                     gen_store_fpr_D(dc, rd, cpu_dst_64);
                     break;
                 default:
@@ -5558,7 +5623,7 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                     tcg_gen_qemu_st64(cpu_val, cpu_addr, dc->mem_idx);
                     break;
                 case 0x1e: /* V9 stxa */
-                    gen_st_asi(dc, cpu_val, cpu_addr, insn, MO_TEQ);
+                    gen_st_asi(dc, cpu_val, cpu_addr, insn, MO_TEUQ);
                     break;
 #endif
                 default:
@@ -5599,11 +5664,11 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                        before performing the first write.  */
                     cpu_src1_64 = gen_load_fpr_Q0(dc, rd);
                     tcg_gen_qemu_st_i64(cpu_src1_64, cpu_addr,
-                                        dc->mem_idx, MO_TEQ | MO_ALIGN_16);
+                                        dc->mem_idx, MO_TEUQ | MO_ALIGN_16);
                     tcg_gen_addi_tl(cpu_addr, cpu_addr, 8);
                     cpu_src2_64 = gen_load_fpr_Q1(dc, rd);
                     tcg_gen_qemu_st_i64(cpu_src1_64, cpu_addr,
-                                        dc->mem_idx, MO_TEQ);
+                                        dc->mem_idx, MO_TEUQ);
                     break;
 #else /* !TARGET_SPARC64 */
                     /* stdfq, store floating point queue */
@@ -5622,7 +5687,7 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                     gen_address_mask(dc, cpu_addr);
                     cpu_src1_64 = gen_load_fpr_D(dc, rd);
                     tcg_gen_qemu_st_i64(cpu_src1_64, cpu_addr, dc->mem_idx,
-                                        MO_TEQ | MO_ALIGN_4);
+                                        MO_TEUQ | MO_ALIGN_4);
                     break;
                 default:
                     goto illegal_insn;
@@ -5784,29 +5849,13 @@ static void sparc_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
     }
 }
 
-static bool sparc_tr_breakpoint_check(DisasContextBase *dcbase, CPUState *cs,
-                                      const CPUBreakpoint *bp)
-{
-    DisasContext *dc = container_of(dcbase, DisasContext, base);
-
-    if (dc->pc != dc->base.pc_first) {
-        save_state(dc);
-    }
-    gen_helper_debug(cpu_env);
-    tcg_gen_exit_tb(NULL, 0);
-    dc->base.is_jmp = DISAS_NORETURN;
-    /* update pc_next so that the current instruction is included in tb->size */
-    dc->base.pc_next += 4;
-    return true;
-}
-
 static void sparc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
     CPUSPARCState *env = cs->env_ptr;
     unsigned int insn;
 
-    insn = cpu_ldl_code(env, dc->pc);
+    insn = translator_ldl(env, &dc->base, dc->pc);
     dc->base.pc_next += 4;
     disas_sparc_insn(dc, insn);
 
@@ -5822,7 +5871,9 @@ static void sparc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
 
-    if (dc->base.is_jmp != DISAS_NORETURN) {
+    switch (dc->base.is_jmp) {
+    case DISAS_NEXT:
+    case DISAS_TOO_MANY:
         if (dc->pc != DYNAMIC_PC &&
             (dc->npc != DYNAMIC_PC && dc->npc != JUMP_PC)) {
             /* static PC and NPC: we can use direct chaining */
@@ -5834,30 +5885,44 @@ static void sparc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
             save_npc(dc);
             tcg_gen_exit_tb(NULL, 0);
         }
+        break;
+
+    case DISAS_NORETURN:
+       break;
+
+    case DISAS_EXIT:
+        /* Exit TB */
+        save_state(dc);
+        tcg_gen_exit_tb(NULL, 0);
+        break;
+
+    default:
+        g_assert_not_reached();
     }
 }
 
-static void sparc_tr_disas_log(const DisasContextBase *dcbase, CPUState *cpu)
+static void sparc_tr_disas_log(const DisasContextBase *dcbase,
+                               CPUState *cpu, FILE *logfile)
 {
-    qemu_log("IN: %s\n", lookup_symbol(dcbase->pc_first));
-    log_target_disas(cpu, dcbase->pc_first, dcbase->tb->size);
+    fprintf(logfile, "IN: %s\n", lookup_symbol(dcbase->pc_first));
+    target_disas(logfile, cpu, dcbase->pc_first, dcbase->tb->size);
 }
 
 static const TranslatorOps sparc_tr_ops = {
     .init_disas_context = sparc_tr_init_disas_context,
     .tb_start           = sparc_tr_tb_start,
     .insn_start         = sparc_tr_insn_start,
-    .breakpoint_check   = sparc_tr_breakpoint_check,
     .translate_insn     = sparc_tr_translate_insn,
     .tb_stop            = sparc_tr_tb_stop,
     .disas_log          = sparc_tr_disas_log,
 };
 
-void gen_intermediate_code(CPUState *cs, TranslationBlock *tb)
+void gen_intermediate_code(CPUState *cs, TranslationBlock *tb, int max_insns,
+                           target_ulong pc, void *host_pc)
 {
     DisasContext dc = {};
 
-    translator_loop(&sparc_tr_ops, &dc.base, cs, tb);
+    translator_loop(cs, tb, max_insns, pc, host_pc, &sparc_tr_ops, &dc.base);
 }
 
 void sparc_tcg_init(void)
@@ -5946,9 +6011,12 @@ void sparc_tcg_init(void)
     }
 }
 
-void restore_state_to_opc(CPUSPARCState *env, TranslationBlock *tb,
-                          target_ulong *data)
+void sparc_restore_state_to_opc(CPUState *cs,
+                                const TranslationBlock *tb,
+                                const uint64_t *data)
 {
+    SPARCCPU *cpu = SPARC_CPU(cs);
+    CPUSPARCState *env = &cpu->env;
     target_ulong pc = data[0];
     target_ulong npc = data[1];
 

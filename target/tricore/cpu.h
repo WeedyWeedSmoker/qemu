@@ -6,7 +6,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -20,23 +20,16 @@
 #ifndef TRICORE_CPU_H
 #define TRICORE_CPU_H
 
-#include "tricore-defs.h"
-#include "qemu-common.h"
 #include "cpu-qom.h"
 #include "exec/cpu-defs.h"
-
-#define CPUArchState struct CPUTriCoreState
-
-struct CPUTriCoreState;
+#include "qemu/cpu-float.h"
+#include "tricore-defs.h"
 
 struct tricore_boot_info;
 
-#define NB_MMU_MODES 3
-
 typedef struct tricore_def_t tricore_def_t;
 
-typedef struct CPUTriCoreState CPUTriCoreState;
-struct CPUTriCoreState {
+typedef struct CPUArchState {
     /* GPR Register */
     uint32_t gpr_a[16];
     uint32_t gpr_d[16];
@@ -190,15 +183,13 @@ struct CPUTriCoreState {
     int error_code;
     uint32_t hflags;    /* CPU State */
 
-    CPU_COMMON
-
     /* Internal CPU feature flags.  */
     uint64_t features;
 
     const tricore_def_t *cpu_model;
     void *irq[8];
     struct QEMUTimer *timer; /* Internal timer */
-};
+} CPUTriCoreState;
 
 /**
  * TriCoreCPU:
@@ -206,26 +197,18 @@ struct CPUTriCoreState {
  *
  * A TriCore CPU.
  */
-struct TriCoreCPU {
+struct ArchCPU {
     /*< private >*/
     CPUState parent_obj;
     /*< public >*/
 
+    CPUNegativeOffsetState neg;
     CPUTriCoreState env;
 };
 
-static inline TriCoreCPU *tricore_env_get_cpu(CPUTriCoreState *env)
-{
-    return TRICORE_CPU(container_of(env, TriCoreCPU, env));
-}
-
-#define ENV_GET_CPU(e) CPU(tricore_env_get_cpu(e))
-
-#define ENV_OFFSET offsetof(TriCoreCPU, env)
 
 hwaddr tricore_cpu_get_phys_page_debug(CPUState *cpu, vaddr addr);
-void tricore_cpu_dump_state(CPUState *cpu, FILE *f,
-                            fprintf_function cpu_fprintf, int flags);
+void tricore_cpu_dump_state(CPUState *cpu, FILE *f, int flags);
 
 
 #define MASK_PCXI_PCPN 0xff000000
@@ -370,14 +353,15 @@ enum {
 
 uint32_t psw_read(CPUTriCoreState *env);
 void psw_write(CPUTriCoreState *env, uint32_t val);
+int tricore_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n);
+int tricore_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n);
 
 void fpu_set_state(CPUTriCoreState *env);
 
 #define MMU_USER_IDX 2
 
-void tricore_cpu_list(FILE *f, fprintf_function cpu_fprintf);
+void tricore_cpu_list(void);
 
-#define cpu_signal_handler cpu_tricore_signal_handler
 #define cpu_list tricore_cpu_list
 
 static inline int cpu_mmu_index(CPUTriCoreState *env, bool ifetch)
@@ -385,25 +369,10 @@ static inline int cpu_mmu_index(CPUTriCoreState *env, bool ifetch)
     return 0;
 }
 
-
-
 #include "exec/cpu-all.h"
-
-enum {
-    /* 1 bit to define user level / supervisor access */
-    ACCESS_USER  = 0x00,
-    ACCESS_SUPER = 0x01,
-    /* 1 bit to indicate direction */
-    ACCESS_STORE = 0x02,
-    /* Type of instruction that generated the access */
-    ACCESS_CODE  = 0x10, /* Code fetch access                */
-    ACCESS_INT   = 0x20, /* Integer load/store access        */
-    ACCESS_FLOAT = 0x30, /* floating point load/store access */
-};
 
 void cpu_state_reset(CPUTriCoreState *s);
 void tricore_tcg_init(void);
-int cpu_tricore_signal_handler(int host_signum, void *pinfo, void *puc);
 
 static inline void cpu_get_tb_cpu_state(CPUTriCoreState *env, target_ulong *pc,
                                         target_ulong *cs_base, uint32_t *flags)
@@ -418,8 +387,8 @@ static inline void cpu_get_tb_cpu_state(CPUTriCoreState *env, target_ulong *pc,
 #define CPU_RESOLVING_TYPE TYPE_TRICORE_CPU
 
 /* helpers.c */
-int cpu_tricore_handle_mmu_fault(CPUState *cpu, target_ulong address,
-                                 int rw, int mmu_idx);
-#define cpu_handle_mmu_fault cpu_tricore_handle_mmu_fault
+bool tricore_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+                          MMUAccessType access_type, int mmu_idx,
+                          bool probe, uintptr_t retaddr);
 
 #endif /* TRICORE_CPU_H */

@@ -21,7 +21,6 @@
 #ifndef QEMU_MSI_H
 #define QEMU_MSI_H
 
-#include "qemu-common.h"
 #include "hw/pci/pci.h"
 
 struct MSIMessage {
@@ -39,10 +38,12 @@ int msi_init(struct PCIDevice *dev, uint8_t offset,
              bool msi_per_vector_mask, Error **errp);
 void msi_uninit(struct PCIDevice *dev);
 void msi_reset(PCIDevice *dev);
+bool msi_is_masked(const PCIDevice *dev, unsigned int vector);
 void msi_notify(PCIDevice *dev, unsigned int vector);
 void msi_send_message(PCIDevice *dev, MSIMessage msg);
 void msi_write_config(PCIDevice *dev, uint32_t addr, uint32_t val, int len);
 unsigned int msi_nr_vectors_allocated(const PCIDevice *dev);
+void msi_set_mask(PCIDevice *dev, int vector, bool mask, Error **errp);
 
 static inline bool msi_present(const PCIDevice *dev)
 {

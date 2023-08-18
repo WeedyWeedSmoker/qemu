@@ -21,20 +21,26 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #include "qemu/osdep.h"
+#include "qemu/units.h"
+#include "sysemu/reset.h"
 #include "qapi/error.h"
-#include "hw/hw.h"
 #include "hw/display/vga.h"
 #include "hw/pci/pci.h"
 #include "vga_int.h"
 #include "vga_regs.h"
 #include "ui/pixel_ops.h"
+#include "ui/console.h"
 #include "qemu/timer.h"
 #include "hw/xen/xen.h"
+#include "migration/vmstate.h"
 #include "trace.h"
 
 //#define DEBUG_VGA_MEM
 //#define DEBUG_VGA_REG
+
+bool have_vga = true;
 
 /* 16 state changes per vertical frame @60 Hz */
 #define VGA_TEXT_CURSOR_PERIOD_MS       (1000 * 2 * 16 / 60)
@@ -84,24 +90,24 @@ const uint8_t gr_mask[16] = {
 
 #define cbswap_32(__x) \
 ((uint32_t)( \
-		(((uint32_t)(__x) & (uint32_t)0x000000ffUL) << 24) | \
-		(((uint32_t)(__x) & (uint32_t)0x0000ff00UL) <<  8) | \
-		(((uint32_t)(__x) & (uint32_t)0x00ff0000UL) >>  8) | \
-		(((uint32_t)(__x) & (uint32_t)0xff000000UL) >> 24) ))
+                (((uint32_t)(__x) & (uint32_t)0x000000ffUL) << 24) | \
+                (((uint32_t)(__x) & (uint32_t)0x0000ff00UL) <<  8) | \
+                (((uint32_t)(__x) & (uint32_t)0x00ff0000UL) >>  8) | \
+                (((uint32_t)(__x) & (uint32_t)0xff000000UL) >> 24) ))
 
-#ifdef HOST_WORDS_BIGENDIAN
+#if HOST_BIG_ENDIAN
 #define PAT(x) cbswap_32(x)
 #else
 #define PAT(x) (x)
 #endif
 
-#ifdef HOST_WORDS_BIGENDIAN
+#if HOST_BIG_ENDIAN
 #define BIG 1
 #else
 #define BIG 0
 #endif
 
-#ifdef HOST_WORDS_BIGENDIAN
+#if HOST_BIG_ENDIAN
 #define GET_PLANE(data, p) (((data) >> (24 - (p) * 8)) & 0xff)
 #else
 #define GET_PLANE(data, p) (((data) >> ((p) * 8)) & 0xff)
@@ -128,7 +134,7 @@ static const uint32_t mask16[16] = {
 
 #undef PAT
 
-#ifdef HOST_WORDS_BIGENDIAN
+#if HOST_BIG_ENDIAN
 #define PAT(x) (x)
 #else
 #define PAT(x) cbswap_32(x)
@@ -721,7 +727,7 @@ uint32_t vbe_ioport_read_data(void *opaque, uint32_t addr)
             val = s->vbe_regs[s->vbe_index];
         }
     } else if (s->vbe_index == VBE_DISPI_INDEX_VIDEO_MEMORY_64K) {
-        val = s->vbe_size / (64 * 1024);
+        val = s->vbe_size / (64 * KiB);
     } else {
         val = 0;
     }
@@ -747,7 +753,8 @@ void vbe_ioport_write_data(void *opaque, uint32_t addr, uint32_t val)
                 val == VBE_DISPI_ID1 ||
                 val == VBE_DISPI_ID2 ||
                 val == VBE_DISPI_ID3 ||
-                val == VBE_DISPI_ID4) {
+                val == VBE_DISPI_ID4 ||
+                val == VBE_DISPI_ID5) {
                 s->vbe_regs[s->vbe_index] = val;
             }
             break;
@@ -1006,6 +1013,7 @@ void vga_mem_writeb(VGACommonState *s, hwaddr addr, uint32_t val)
 typedef void vga_draw_line_func(VGACommonState *s1, uint8_t *d,
                                 uint32_t srcaddr, int width);
 
+#include "vga-access.h"
 #include "vga-helpers.h"
 
 /* return true if the palette was modified */
@@ -1289,7 +1297,7 @@ static void vga_draw_text(VGACommonState *s, int full_update)
                 if (cx > cx_max)
                     cx_max = cx;
                 *ch_attr_ptr = ch_attr;
-#ifdef HOST_WORDS_BIGENDIAN
+#if HOST_BIG_ENDIAN
                 ch = ch_attr >> 8;
                 cattr = ch_attr & 0xff;
 #else
@@ -1470,7 +1478,7 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
     vga_draw_line_func *vga_draw_line = NULL;
     bool share_surface, force_shadow = false;
     pixman_format_code_t format;
-#ifdef HOST_WORDS_BIGENDIAN
+#if HOST_BIG_ENDIAN
     bool byteswap = !s->big_endian_fb;
 #else
     bool byteswap = s->big_endian_fb;
@@ -1507,9 +1515,10 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
         force_shadow = true;
     }
 
+    /* bits 5-6: 0 = 16-color mode, 1 = 4-color mode, 2 = 256-color mode.  */
     shift_control = (s->gr[VGA_GFX_MODE] >> 5) & 3;
     double_scan = (s->cr[VGA_CRTC_MAX_SCAN] >> 7);
-    if (shift_control != 1) {
+    if (s->cr[VGA_CRTC_MODE] & 1) {
         multi_scan = (((s->cr[VGA_CRTC_MAX_SCAN] & 0x1f) + 1) << double_scan)
             - 1;
     } else {
@@ -1670,7 +1679,6 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
         if (!(s->cr[VGA_CRTC_MODE] & 2)) {
             addr = (addr & ~0x8000) | ((y1 & 2) << 14);
         }
-        update = full_update;
         page0 = addr & s->vbe_size_mask;
         page1 = (addr + bwidth - 1) & s->vbe_size_mask;
         if (full_update) {
@@ -1744,8 +1752,7 @@ static void vga_draw_blank(VGACommonState *s, int full_update)
         memset(d, 0, w);
         d += surface_stride(surface);
     }
-    dpy_gfx_update(s->con, 0, 0,
-                   s->last_scr_width, s->last_scr_height);
+    dpy_gfx_update_full(s->con);
 }
 
 #define GMODE_TEXT     0
@@ -2163,9 +2170,10 @@ static inline uint32_t uint_clamp(uint32_t val, uint32_t vmin, uint32_t vmax)
     return val;
 }
 
-void vga_common_init(VGACommonState *s, Object *obj, bool global_vmstate)
+bool vga_common_init(VGACommonState *s, Object *obj, Error **errp)
 {
     int i, j, v, b;
+    Error *local_err = NULL;
 
     for(i = 0;i < 256; i++) {
         v = 0;
@@ -2192,7 +2200,7 @@ void vga_common_init(VGACommonState *s, Object *obj, bool global_vmstate)
 
     s->vram_size_mb = uint_clamp(s->vram_size_mb, 1, 512);
     s->vram_size_mb = pow2ceil(s->vram_size_mb);
-    s->vram_size = s->vram_size_mb << 20;
+    s->vram_size = s->vram_size_mb * MiB;
 
     if (!s->vbe_size) {
         s->vbe_size = s->vram_size;
@@ -2200,9 +2208,19 @@ void vga_common_init(VGACommonState *s, Object *obj, bool global_vmstate)
     s->vbe_size_mask = s->vbe_size - 1;
 
     s->is_vbe_vmstate = 1;
+
+    if (s->global_vmstate && qemu_ram_block_by_name("vga.vram")) {
+        error_setg(errp, "Only one global VGA device can be used at a time");
+        return false;
+    }
+
     memory_region_init_ram_nomigrate(&s->vram, obj, "vga.vram", s->vram_size,
-                           &error_fatal);
-    vmstate_register_ram(&s->vram, global_vmstate ? NULL : DEVICE(obj));
+                                     &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return false;
+    }
+    vmstate_register_ram(&s->vram, s->global_vmstate ? NULL : DEVICE(obj));
     xen_register_framebuffer(&s->vram);
     s->vram_ptr = memory_region_get_ram_ptr(&s->vram);
     s->get_bpp = vga_get_bpp;
@@ -2226,12 +2244,14 @@ void vga_common_init(VGACommonState *s, Object *obj, bool global_vmstate)
      * into a device attribute set by the machine/platform to remove
      * all target endian dependencies from this file.
      */
-#ifdef TARGET_WORDS_BIGENDIAN
+#if TARGET_BIG_ENDIAN
     s->default_endian_fb = true;
 #else
     s->default_endian_fb = false;
 #endif
     vga_dirty_log_start(s);
+
+    return true;
 }
 
 static const MemoryRegionPortio vga_portio_list[] = {
@@ -2297,18 +2317,4 @@ void vga_init(VGACommonState *s, Object *obj, MemoryRegion *address_space,
         portio_list_init(&s->vbe_port_list, obj, vbe_ports, s, "vbe");
         portio_list_add(&s->vbe_port_list, address_space_io, 0x1ce);
     }
-}
-
-void vga_init_vbe(VGACommonState *s, Object *obj, MemoryRegion *system_memory)
-{
-    /* With pc-0.12 and below we map both the PCI BAR and the fixed VBE region,
-     * so use an alias to avoid double-mapping the same region.
-     */
-    memory_region_init_alias(&s->vram_vbe, obj, "vram.vbe",
-                             &s->vram, 0, memory_region_size(&s->vram));
-    /* XXX: use optimized standard vga accesses */
-    memory_region_add_subregion(system_memory,
-                                VBE_DISPI_LFB_PHYSICAL_ADDRESS,
-                                &s->vram_vbe);
-    s->vbe_mapped = 1;
 }

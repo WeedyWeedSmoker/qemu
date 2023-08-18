@@ -10,16 +10,15 @@
  *
  */
 #include "qemu/osdep.h"
-#include "qemu-common.h"
 #include "cpu.h"
 #include "kvm_arm.h"
 
 bool write_kvmstate_to_list(ARMCPU *cpu)
 {
-    abort();
+    g_assert_not_reached();
 }
 
 bool write_list_to_kvmstate(ARMCPU *cpu, int level)
 {
-    abort();
+    g_assert_not_reached();
 }

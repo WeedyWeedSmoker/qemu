@@ -16,15 +16,19 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/hw.h"
 #include "hw/pci/pci.h"
+#include "hw/qdev-properties.h"
+#include "hw/qdev-properties-system.h"
+#include "migration/vmstate.h"
 #include "hw/pci/msix.h"
 #include "net/net.h"
 #include "net/eth.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-rocker.h"
 #include "qemu/iov.h"
+#include "qemu/module.h"
 #include "qemu/bitops.h"
+#include "qemu/log.h"
 
 #include "rocker.h"
 #include "rocker_hw.h"
@@ -69,11 +73,6 @@ struct rocker {
 
     QLIST_ENTRY(rocker) next;
 };
-
-#define TYPE_ROCKER "rocker"
-
-#define ROCKER(obj) \
-    OBJECT_CHECK(Rocker, (obj), TYPE_ROCKER)
 
 static QLIST_HEAD(, rocker) rockers;
 
@@ -129,13 +128,7 @@ RockerPortList *qmp_query_rocker_ports(const char *name, Error **errp)
     }
 
     for (i = r->fp_ports - 1; i >= 0; i--) {
-        RockerPortList *info = g_malloc0(sizeof(*info));
-        info->value = g_malloc0(sizeof(*info->value));
-        struct fp_port *port = r->fp_port[i];
-
-        fp_port_get_info(port, info);
-        info->next = list;
-        list = info;
+        QAPI_LIST_PREPEND(list, fp_port_get_info(r->fp_port[i]));
     }
 
     return list;
@@ -205,14 +198,22 @@ static int tx_consume(Rocker *r, DescInfo *info)
 
     if (tlvs[ROCKER_TLV_TX_L3_CSUM_OFF]) {
         tx_l3_csum_off = rocker_tlv_get_le16(tlvs[ROCKER_TLV_TX_L3_CSUM_OFF]);
+        qemu_log_mask(LOG_UNIMP, "rocker %s: L3 not implemented"
+                                 " (cksum off: %u)\n",
+                      __func__, tx_l3_csum_off);
     }
 
     if (tlvs[ROCKER_TLV_TX_TSO_MSS]) {
         tx_tso_mss = rocker_tlv_get_le16(tlvs[ROCKER_TLV_TX_TSO_MSS]);
+        qemu_log_mask(LOG_UNIMP, "rocker %s: TSO not implemented (MSS: %u)\n",
+                      __func__, tx_tso_mss);
     }
 
     if (tlvs[ROCKER_TLV_TX_TSO_HDR_LEN]) {
         tx_tso_hdr_len = rocker_tlv_get_le16(tlvs[ROCKER_TLV_TX_TSO_HDR_LEN]);
+        qemu_log_mask(LOG_UNIMP, "rocker %s: TSO not implemented"
+                                 " (hdr length: %u)\n",
+                      __func__, tx_tso_hdr_len);
     }
 
     rocker_tlv_for_each_nested(tlv_frag, tlvs[ROCKER_TLV_TX_FRAGS], rem) {
@@ -245,12 +246,6 @@ static int tx_consume(Rocker *r, DescInfo *info)
                      iov[iovcnt].iov_len);
 
         iovcnt++;
-    }
-
-    if (iovcnt) {
-        /* XXX perform Tx offloads */
-        /* XXX   silence compiler for now */
-        tx_l3_csum_off += tx_tso_mss = tx_tso_hdr_len = 0;
     }
 
     err = fp_port_eg(r->fp_port[port], iov, iovcnt);
@@ -1015,7 +1010,7 @@ static uint64_t rocker_port_phys_link_status(Rocker *r)
         FpPort *port = r->fp_port[i];
 
         if (fp_port_get_link_up(port)) {
-            status |= 1 << (i + 1);
+            status |= 1ULL << (i + 1);
         }
     }
     return status;
@@ -1030,7 +1025,7 @@ static uint64_t rocker_port_phys_enable_read(Rocker *r)
         FpPort *port = r->fp_port[i];
 
         if (fp_port_enabled(port)) {
-            ret |= 1 << (i + 1);
+            ret |= 1ULL << (i + 1);
         }
     }
     return ret;
@@ -1217,24 +1212,14 @@ static void rocker_msix_vectors_unuse(Rocker *r,
     }
 }
 
-static int rocker_msix_vectors_use(Rocker *r,
-                                   unsigned int num_vectors)
+static void rocker_msix_vectors_use(Rocker *r, unsigned int num_vectors)
 {
     PCIDevice *dev = PCI_DEVICE(r);
-    int err;
     int i;
 
     for (i = 0; i < num_vectors; i++) {
-        err = msix_vector_use(dev, i);
-        if (err) {
-            goto rollback;
-        }
+        msix_vector_use(dev, i);
     }
-    return 0;
-
-rollback:
-    rocker_msix_vectors_unuse(r, i);
-    return err;
 }
 
 static int rocker_msix_init(Rocker *r, Error **errp)
@@ -1252,16 +1237,9 @@ static int rocker_msix_init(Rocker *r, Error **errp)
         return err;
     }
 
-    err = rocker_msix_vectors_use(r, ROCKER_MSIX_VEC_COUNT(r->fp_ports));
-    if (err) {
-        goto err_msix_vectors_use;
-    }
+    rocker_msix_vectors_use(r, ROCKER_MSIX_VEC_COUNT(r->fp_ports));
 
     return 0;
-
-err_msix_vectors_use:
-    msix_uninit(dev, &r->msix_bar, &r->msix_bar);
-    return err;
 }
 
 static void rocker_msix_uninit(Rocker *r)
@@ -1279,7 +1257,7 @@ static World *rocker_world_type_by_name(Rocker *r, const char *name)
     for (i = 0; i < ROCKER_WORLD_TYPE_MAX; i++) {
         if (strcmp(name, world_name(r->worlds[i])) == 0) {
             return r->worlds[i];
-	}
+        }
     }
     return NULL;
 }
@@ -1517,7 +1495,7 @@ static void rocker_class_init(ObjectClass *klass, void *data)
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
     dc->desc = "Rocker Switch";
     dc->reset = rocker_reset;
-    dc->props = rocker_properties;
+    device_class_set_props(dc, rocker_properties);
     dc->vmsd = &rocker_vmsd;
 }
 

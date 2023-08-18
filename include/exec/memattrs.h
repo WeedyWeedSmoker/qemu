@@ -35,8 +35,28 @@ typedef struct MemTxAttrs {
     unsigned int secure:1;
     /* Memory access is usermode (unprivileged) */
     unsigned int user:1;
+    /*
+     * Bus interconnect and peripherals can access anything (memories,
+     * devices) by default. By setting the 'memory' bit, bus transaction
+     * are restricted to "normal" memories (per the AMBA documentation)
+     * versus devices. Access to devices will be logged and rejected
+     * (see MEMTX_ACCESS_ERROR).
+     */
+    unsigned int memory:1;
     /* Requester ID (for MSI for example) */
     unsigned int requester_id:16;
+    /* Invert endianness for this page */
+    unsigned int byte_swap:1;
+    /*
+     * The following are target-specific page-table bits.  These are not
+     * related to actual memory transactions at all.  However, this structure
+     * is part of the tlb_fill interface, cached in the cputlb structure,
+     * and has unused bits.  These fields will be read by target-specific
+     * helpers using env->iotlb[mmu_idx][tlb_index()].attrs.target_tlb_bitN.
+     */
+    unsigned int target_tlb_bit0 : 1;
+    unsigned int target_tlb_bit1 : 1;
+    unsigned int target_tlb_bit2 : 1;
 } MemTxAttrs;
 
 /* Bus masters which don't specify any attributes will get this,
@@ -54,6 +74,7 @@ typedef struct MemTxAttrs {
 #define MEMTX_OK 0
 #define MEMTX_ERROR             (1U << 0) /* device returned an error */
 #define MEMTX_DECODE_ERROR      (1U << 1) /* nothing at that address */
+#define MEMTX_ACCESS_ERROR      (1U << 2) /* access denied */
 typedef uint32_t MemTxResult;
 
 #endif

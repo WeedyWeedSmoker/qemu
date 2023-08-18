@@ -22,7 +22,7 @@
 * This library is free software; you can redistribute it and/or
 * modify it under the terms of the GNU Lesser General Public
 * License as published by the Free Software Foundation; either
-* version 2 of the License, or (at your option) any later version.
+* version 2.1 of the License, or (at your option) any later version.
 *
 * This library is distributed in the hope that it will be useful,
 * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -34,11 +34,12 @@
 */
 
 #include "qemu/osdep.h"
-#include "sysemu/sysemu.h"
+#include "qemu/log.h"
 #include "net/net.h"
 #include "net/tap.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/msix.h"
+#include "sysemu/runstate.h"
 
 #include "net_tx_pkt.h"
 #include "net_rx_pkt.h"
@@ -158,6 +159,8 @@ e1000e_intrmgr_on_throttling_timer(void *opaque)
 
     if (msi_enabled(timer->core->owner)) {
         trace_e1000e_irq_msi_notify_postponed();
+        /* Clear msi_causes_pending to fire MSI eventually */
+        timer->core->msi_causes_pending = 0;
         e1000e_set_interrupt_cause(timer->core, 0);
     } else {
         trace_e1000e_irq_legacy_notify_postponed();
@@ -433,23 +436,16 @@ e1000e_intrmgr_pci_unint(E1000ECore *core)
 {
     int i;
 
-    timer_del(core->radv.timer);
     timer_free(core->radv.timer);
-    timer_del(core->rdtr.timer);
     timer_free(core->rdtr.timer);
-    timer_del(core->raid.timer);
     timer_free(core->raid.timer);
 
-    timer_del(core->tadv.timer);
     timer_free(core->tadv.timer);
-    timer_del(core->tidv.timer);
     timer_free(core->tidv.timer);
 
-    timer_del(core->itr.timer);
     timer_free(core->itr.timer);
 
     for (i = 0; i < E1000E_MSIX_VEC_NUM; i++) {
-        timer_del(core->eitr[i].timer);
         timer_free(core->eitr[i].timer);
     }
 }
@@ -581,7 +577,7 @@ e1000e_rss_calc_hash(E1000ECore *core,
         type = NetPktRssIpV4Tcp;
         break;
     case E1000_MRQ_RSS_TYPE_IPV6TCP:
-        type = NetPktRssIpV6Tcp;
+        type = NetPktRssIpV6TcpEx;
         break;
     case E1000_MRQ_RSS_TYPE_IPV6:
         type = NetPktRssIpV6;
@@ -737,7 +733,7 @@ e1000e_process_tx_desc(E1000ECore *core,
             if (e1000x_vlan_enabled(core->mac) &&
                 e1000x_is_vlan_txd(txd_lower)) {
                 net_tx_pkt_setup_vlan_header_ex(tx->tx_pkt,
-                    le16_to_cpu(dp->upper.fields.special), core->vet);
+                    le16_to_cpu(dp->upper.fields.special), core->mac[VET]);
             }
             if (e1000e_tx_pkt_send(core, tx, queue_index)) {
                 e1000e_on_tx_done_update_stats(core, tx->tx_pkt);
@@ -966,7 +962,7 @@ e1000e_start_recv(E1000ECore *core)
     }
 }
 
-int
+bool
 e1000e_can_receive(E1000ECore *core)
 {
     int i;
@@ -1018,7 +1014,7 @@ e1000e_receive_filter(E1000ECore *core, const uint8_t *buf, int size)
 {
     uint32_t rctl = core->mac[RCTL];
 
-    if (e1000x_is_vlan_packet(buf, core->vet) &&
+    if (e1000x_is_vlan_packet(buf, core->mac[VET]) &&
         e1000x_vlan_rx_filter_enabled(core->mac)) {
         uint16_t vid = lduw_be_p(buf + 14);
         uint32_t vfta = ldl_le_p((uint32_t *)(core->mac + VFTA) +
@@ -1291,7 +1287,6 @@ e1000e_write_lgcy_rx_descr(E1000ECore *core, uint8_t *desc,
                              &d->special);
     d->errors = (uint8_t) (le32_to_cpu(status_flags) >> 24);
     d->status = (uint8_t) le32_to_cpu(status_flags);
-    d->special = 0;
 }
 
 static inline void
@@ -1365,6 +1360,57 @@ struct NetRxPkt *pkt, const E1000E_RSSInfo *rss_info,
             assert(ps_hdr_len == 0);
             e1000e_write_ext_rx_descr(core, desc, pkt, rss_info,
                                        (*written)[0]);
+        }
+    }
+}
+
+static inline void
+e1000e_pci_dma_write_rx_desc(E1000ECore *core, dma_addr_t addr,
+                             uint8_t *desc, dma_addr_t len)
+{
+    PCIDevice *dev = core->owner;
+
+    if (e1000e_rx_use_legacy_descriptor(core)) {
+        struct e1000_rx_desc *d = (struct e1000_rx_desc *) desc;
+        size_t offset = offsetof(struct e1000_rx_desc, status);
+        uint8_t status = d->status;
+
+        d->status &= ~E1000_RXD_STAT_DD;
+        pci_dma_write(dev, addr, desc, len);
+
+        if (status & E1000_RXD_STAT_DD) {
+            d->status = status;
+            pci_dma_write(dev, addr + offset, &status, sizeof(status));
+        }
+    } else {
+        if (core->mac[RCTL] & E1000_RCTL_DTYP_PS) {
+            union e1000_rx_desc_packet_split *d =
+                (union e1000_rx_desc_packet_split *) desc;
+            size_t offset = offsetof(union e1000_rx_desc_packet_split,
+                wb.middle.status_error);
+            uint32_t status = d->wb.middle.status_error;
+
+            d->wb.middle.status_error &= ~E1000_RXD_STAT_DD;
+            pci_dma_write(dev, addr, desc, len);
+
+            if (status & E1000_RXD_STAT_DD) {
+                d->wb.middle.status_error = status;
+                pci_dma_write(dev, addr + offset, &status, sizeof(status));
+            }
+        } else {
+            union e1000_rx_desc_extended *d =
+                (union e1000_rx_desc_extended *) desc;
+            size_t offset = offsetof(union e1000_rx_desc_extended,
+                wb.upper.status_error);
+            uint32_t status = d->wb.upper.status_error;
+
+            d->wb.upper.status_error &= ~E1000_RXD_STAT_DD;
+            pci_dma_write(dev, addr, desc, len);
+
+            if (status & E1000_RXD_STAT_DD) {
+                d->wb.upper.status_error = status;
+                pci_dma_write(dev, addr + offset, &status, sizeof(status));
+            }
         }
     }
 }
@@ -1595,17 +1641,17 @@ e1000e_write_packet_to_guest(E1000ECore *core, struct NetRxPkt *pkt,
                           (const char *) &fcs_pad, e1000x_fcs_len(core->mac));
                 }
             }
-            desc_offset += desc_size;
-            if (desc_offset >= total_size) {
-                is_last = true;
-            }
         } else { /* as per intel docs; skip descriptors with null buf addr */
             trace_e1000e_rx_null_descriptor();
+        }
+        desc_offset += desc_size;
+        if (desc_offset >= total_size) {
+            is_last = true;
         }
 
         e1000e_write_rx_descr(core, desc, is_last ? core->rx_pkt : NULL,
                            rss_info, do_ps ? ps_hdr_len : 0, &bastate.written);
-        pci_dma_write(d, base, &desc, core->rx_desc_len);
+        e1000e_pci_dma_write_rx_desc(core, base, desc, core->rx_desc_len);
 
         e1000e_ring_advance(core, rxi,
                             core->rx_desc_len / E1000_MIN_RX_DESC_LEN);
@@ -1627,15 +1673,16 @@ e1000e_rx_fix_l4_csum(E1000ECore *core, struct NetRxPkt *pkt)
     }
 }
 
+/* Min. octets in an ethernet frame sans FCS */
+#define MIN_BUF_SIZE 60
+
 ssize_t
 e1000e_receive_iov(E1000ECore *core, const struct iovec *iov, int iovcnt)
 {
     static const int maximum_ethernet_hdr_len = (14 + 4);
-    /* Min. octets in an ethernet frame sans FCS */
-    static const int min_buf_size = 60;
 
     uint32_t n = 0;
-    uint8_t min_buf[min_buf_size];
+    uint8_t min_buf[MIN_BUF_SIZE];
     struct iovec min_iov;
     uint8_t *filter_buf;
     size_t size, orig_size;
@@ -1692,7 +1739,7 @@ e1000e_receive_iov(E1000ECore *core, const struct iovec *iov, int iovcnt)
     }
 
     net_rx_pkt_attach_iovec_ex(core->rx_pkt, iov, iovcnt, iov_ofs,
-                               e1000x_vlan_enabled(core->mac), core->vet);
+                               e1000x_vlan_enabled(core->mac), core->mac[VET]);
 
     e1000e_rss_parse_packet(core, core->rx_pkt, &rss_info);
     e1000e_rx_ring_init(core, &rxr, rss_info.queue);
@@ -2023,6 +2070,7 @@ e1000e_msix_notify_one(E1000ECore *core, uint32_t cause, uint32_t int_cfg)
     effective_eiac = core->mac[EIAC] & cause;
 
     core->mac[ICR] &= ~effective_eiac;
+    core->msi_causes_pending &= ~effective_eiac;
 
     if (!(core->mac[CTRL_EXT] & E1000_CTRL_EXT_IAME)) {
         core->mac[IMS] &= ~effective_eiac;
@@ -2119,6 +2167,13 @@ e1000e_send_msi(E1000ECore *core, bool msix)
 {
     uint32_t causes = core->mac[ICR] & core->mac[IMS] & ~E1000_ICR_ASSERTED;
 
+    core->msi_causes_pending &= causes;
+    causes ^= core->msi_causes_pending;
+    if (causes == 0) {
+        return;
+    }
+    core->msi_causes_pending |= causes;
+
     if (msix) {
         e1000e_msix_notify(core, causes);
     } else {
@@ -2156,6 +2211,9 @@ e1000e_update_interrupt_state(E1000ECore *core)
     core->mac[ICS] = core->mac[ICR];
 
     interrupts_pending = (core->mac[IMS] & core->mac[ICR]) ? true : false;
+    if (!interrupts_pending) {
+        core->msi_causes_pending = 0;
+    }
 
     trace_e1000e_irq_pending_interrupts(core->mac[ICR] & core->mac[IMS],
                                         core->mac[ICR], core->mac[IMS]);
@@ -2392,8 +2450,7 @@ static void
 e1000e_set_vet(E1000ECore *core, int index, uint32_t val)
 {
     core->mac[VET] = val & 0xffff;
-    core->vet = le16_to_cpu(core->mac[VET]);
-    trace_e1000e_vlan_vet(core->vet);
+    trace_e1000e_vlan_vet(core->mac[VET]);
 }
 
 static void
@@ -2604,6 +2661,11 @@ e1000e_mac_icr_read(E1000ECore *core, int index)
         core->mac[ICR] = 0;
     }
 
+    if (!msix_enabled(core->owner)) {
+        trace_e1000e_irq_icr_clear_nonmsix_icr_read();
+        core->mac[ICR] = 0;
+    }
+
     if ((core->mac[ICR] & E1000_ICR_ASSERTED) &&
         (core->mac[CTRL_EXT] & E1000_CTRL_EXT_IAME)) {
         trace_e1000e_irq_icr_clear_iame();
@@ -2801,12 +2863,19 @@ e1000e_set_eitr(E1000ECore *core, int index, uint32_t val)
 static void
 e1000e_set_psrctl(E1000ECore *core, int index, uint32_t val)
 {
-    if ((val & E1000_PSRCTL_BSIZE0_MASK) == 0) {
-        hw_error("e1000e: PSRCTL.BSIZE0 cannot be zero");
-    }
+    if (core->mac[RCTL] & E1000_RCTL_DTYP_MASK) {
 
-    if ((val & E1000_PSRCTL_BSIZE1_MASK) == 0) {
-        hw_error("e1000e: PSRCTL.BSIZE1 cannot be zero");
+        if ((val & E1000_PSRCTL_BSIZE0_MASK) == 0) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "e1000e: PSRCTL.BSIZE0 cannot be zero");
+            return;
+        }
+
+        if ((val & E1000_PSRCTL_BSIZE1_MASK) == 0) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "e1000e: PSRCTL.BSIZE1 cannot be zero");
+            return;
+        }
     }
 
     core->mac[PSRCTL] = val;
@@ -2840,7 +2909,8 @@ e1000e_set_gcr(E1000ECore *core, int index, uint32_t val)
 }
 
 #define e1000e_getreg(x)    [x] = e1000e_mac_readreg
-static uint32_t (*e1000e_macreg_readops[])(E1000ECore *, int) = {
+typedef uint32_t (*readops)(E1000ECore *, int);
+static const readops e1000e_macreg_readops[] = {
     e1000e_getreg(PBA),
     e1000e_getreg(WUFC),
     e1000e_getreg(MANC),
@@ -2896,7 +2966,6 @@ static uint32_t (*e1000e_macreg_readops[])(E1000ECore *, int) = {
     e1000e_getreg(TSYNCRXCTL),
     e1000e_getreg(TDH),
     e1000e_getreg(LEDCTL),
-    e1000e_getreg(STATUS),
     e1000e_getreg(TCTL),
     e1000e_getreg(TDBAL),
     e1000e_getreg(TDLEN),
@@ -3046,7 +3115,8 @@ static uint32_t (*e1000e_macreg_readops[])(E1000ECore *, int) = {
 enum { E1000E_NREADOPS = ARRAY_SIZE(e1000e_macreg_readops) };
 
 #define e1000e_putreg(x)    [x] = e1000e_mac_writereg
-static void (*e1000e_macreg_writeops[])(E1000ECore *, int, uint32_t) = {
+typedef void (*writeops)(E1000ECore *, int, uint32_t);
+static const writeops e1000e_macreg_writeops[] = {
     e1000e_putreg(PBA),
     e1000e_putreg(SWSM),
     e1000e_putreg(WUFC),
@@ -3121,7 +3191,6 @@ static void (*e1000e_macreg_writeops[])(E1000ECore *, int, uint32_t) = {
     e1000e_putreg(RXCFGL),
     e1000e_putreg(TSYNCRXCTL),
     e1000e_putreg(TSYNCTXCTL),
-    e1000e_putreg(FLSWDATA),
     e1000e_putreg(EXTCNF_SIZE),
     e1000e_putreg(EEMNGCTL),
     e1000e_putreg(RA),
@@ -3286,7 +3355,7 @@ e1000e_autoneg_resume(E1000ECore *core)
 }
 
 static void
-e1000e_vm_state_change(void *opaque, int running, RunState state)
+e1000e_vm_state_change(void *opaque, bool running, RunState state)
 {
     E1000ECore *core = opaque;
 
@@ -3336,7 +3405,6 @@ e1000e_core_pci_uninit(E1000ECore *core)
 {
     int i;
 
-    timer_del(core->autoneg_timer);
     timer_free(core->autoneg_timer);
 
     e1000e_intrmgr_pci_unint(core);

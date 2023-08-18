@@ -17,13 +17,13 @@
  * See the COPYING.LIB file in the top-level directory.
  *
  */
+
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "qemu-common.h"
 #include "block/block_int.h"
 #include "qemu/error-report.h"
-#include "qemu/module.h"
 #include "qemu/bswap.h"
+#include "qemu/memalign.h"
 #include "vhdx.h"
 
 
@@ -84,7 +84,7 @@ static int vhdx_log_peek_hdr(BlockDriverState *bs, VHDXLogEntries *log,
 
     offset = log->offset + read;
 
-    ret = bdrv_pread(bs->file, offset, hdr, sizeof(VHDXLogEntryHeader));
+    ret = bdrv_pread(bs->file, offset, sizeof(VHDXLogEntryHeader), hdr, 0);
     if (ret < 0) {
         goto exit;
     }
@@ -144,7 +144,7 @@ static int vhdx_log_read_sectors(BlockDriverState *bs, VHDXLogEntries *log,
         }
         offset = log->offset + read;
 
-        ret = bdrv_pread(bs->file, offset, buffer, VHDX_LOG_SECTOR_SIZE);
+        ret = bdrv_pread(bs->file, offset, VHDX_LOG_SECTOR_SIZE, buffer, 0);
         if (ret < 0) {
             goto exit;
         }
@@ -194,8 +194,8 @@ static int vhdx_log_write_sectors(BlockDriverState *bs, VHDXLogEntries *log,
             /* full */
             break;
         }
-        ret = bdrv_pwrite(bs->file, offset, buffer_tmp,
-                          VHDX_LOG_SECTOR_SIZE);
+        ret = bdrv_pwrite(bs->file, offset, VHDX_LOG_SECTOR_SIZE, buffer_tmp,
+                          0);
         if (ret < 0) {
             goto exit;
         }
@@ -466,8 +466,8 @@ static int vhdx_log_flush_desc(BlockDriverState *bs, VHDXLogDescriptor *desc,
 
     /* count is only > 1 if we are writing zeroes */
     for (i = 0; i < count; i++) {
-        ret = bdrv_pwrite_sync(bs->file, file_offset, buffer,
-                               VHDX_LOG_SECTOR_SIZE);
+        ret = bdrv_pwrite_sync(bs->file, file_offset, VHDX_LOG_SECTOR_SIZE,
+                               buffer, 0);
         if (ret < 0) {
             goto exit;
         }
@@ -551,15 +551,15 @@ static int vhdx_log_flush(BlockDriverState *bs, BDRVVHDXState *s,
         }
         if (file_length < desc_entries->hdr.last_file_offset) {
             new_file_size = desc_entries->hdr.last_file_offset;
-            if (new_file_size % (1024*1024)) {
+            if (new_file_size % (1 * MiB)) {
                 /* round up to nearest 1MB boundary */
                 new_file_size = QEMU_ALIGN_UP(new_file_size, MiB);
                 if (new_file_size > INT64_MAX) {
                     ret = -EINVAL;
                     goto exit;
                 }
-                ret = bdrv_truncate(bs->file, new_file_size, PREALLOC_MODE_OFF,
-                                    NULL);
+                ret = bdrv_truncate(bs->file, new_file_size, false,
+                                    PREALLOC_MODE_OFF, 0, NULL);
                 if (ret < 0) {
                     goto exit;
                 }
@@ -802,7 +802,8 @@ int vhdx_parse_log(BlockDriverState *bs, BDRVVHDXState *s, bool *flushed,
     }
 
     if (logs.valid) {
-        if (bs->read_only) {
+        if (bdrv_is_read_only(bs)) {
+            bdrv_refresh_filename(bs);
             ret = -EPERM;
             error_setg(errp,
                        "VHDX image file '%s' opened read-only, but "
@@ -835,11 +836,11 @@ static void vhdx_log_raw_to_le_sector(VHDXLogDescriptor *desc,
     /* 8 + 4084 + 4 = 4096, 1 log sector */
     memcpy(&desc->leading_bytes, data, 8);
     data += 8;
-    cpu_to_le64s(&desc->leading_bytes);
+    desc->leading_bytes = cpu_to_le64(desc->leading_bytes);
     memcpy(sector->data, data, 4084);
     data += 4084;
     memcpy(&desc->trailing_bytes, data, 4);
-    cpu_to_le32s(&desc->trailing_bytes);
+    desc->trailing_bytes = cpu_to_le32(desc->trailing_bytes);
     data += 4;
 
     sector->sequence_high  = (uint32_t) (seq >> 32);
@@ -969,8 +970,8 @@ static int vhdx_log_write(BlockDriverState *bs, BDRVVHDXState *s,
 
         if (i == 0 && leading_length) {
             /* partial sector at the front of the buffer */
-            ret = bdrv_pread(bs->file, file_offset, merged_sector,
-                             VHDX_LOG_SECTOR_SIZE);
+            ret = bdrv_pread(bs->file, file_offset, VHDX_LOG_SECTOR_SIZE,
+                             merged_sector, 0);
             if (ret < 0) {
                 goto exit;
             }
@@ -979,10 +980,9 @@ static int vhdx_log_write(BlockDriverState *bs, BDRVVHDXState *s,
             sector_write = merged_sector;
         } else if (i == sectors - 1 && trailing_length) {
             /* partial sector at the end of the buffer */
-            ret = bdrv_pread(bs->file,
-                            file_offset,
-                            merged_sector + trailing_length,
-                            VHDX_LOG_SECTOR_SIZE - trailing_length);
+            ret = bdrv_pread(bs->file, file_offset,
+                             VHDX_LOG_SECTOR_SIZE - trailing_length,
+                             merged_sector + trailing_length, 0);
             if (ret < 0) {
                 goto exit;
             }

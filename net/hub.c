@@ -20,6 +20,7 @@
 #include "hub.h"
 #include "qemu/iov.h"
 #include "qemu/error-report.h"
+#include "sysemu/qtest.h"
 
 /*
  * A hub broadcasts incoming packets to all its ports except the source port.
@@ -89,7 +90,7 @@ static NetHub *net_hub_new(int id)
     return hub;
 }
 
-static int net_hub_port_can_receive(NetClientState *nc)
+static bool net_hub_port_can_receive(NetClientState *nc)
 {
     NetHubPort *port;
     NetHubPort *src_port = DO_UPCAST(NetHubPort, nc, nc);
@@ -101,11 +102,11 @@ static int net_hub_port_can_receive(NetClientState *nc)
         }
 
         if (qemu_can_send_packet(&port->nc)) {
-            return 1;
+            return true;
         }
     }
 
-    return 0;
+    return false;
 }
 
 static ssize_t net_hub_port_receive(NetClientState *nc,
@@ -190,29 +191,6 @@ NetClientState *net_hub_add_port(int hub_id, const char *name,
 
     port = net_hub_port_new(hub, name, hubpeer);
     return &port->nc;
-}
-
-/**
- * Find a specific client on a hub
- */
-NetClientState *net_hub_find_client_by_name(int hub_id, const char *name)
-{
-    NetHub *hub;
-    NetHubPort *port;
-    NetClientState *peer;
-
-    QLIST_FOREACH(hub, &hubs, next) {
-        if (hub->id == hub_id) {
-            QLIST_FOREACH(port, &hub->ports, next) {
-                peer = port->nc.peer;
-
-                if (peer && strcmp(peer->name, name) == 0) {
-                    return peer;
-                }
-            }
-        }
-    }
-    return NULL;
 }
 
 /**
@@ -335,6 +313,8 @@ void net_hub_check_clients(void)
             case NET_CLIENT_DRIVER_USER:
             case NET_CLIENT_DRIVER_TAP:
             case NET_CLIENT_DRIVER_SOCKET:
+            case NET_CLIENT_DRIVER_STREAM:
+            case NET_CLIENT_DRIVER_DGRAM:
             case NET_CLIENT_DRIVER_VDE:
             case NET_CLIENT_DRIVER_VHOST_USER:
                 has_host_dev = 1;
@@ -346,7 +326,7 @@ void net_hub_check_clients(void)
         if (has_host_dev && !has_nic) {
             warn_report("hub %d with no nics", hub->id);
         }
-        if (has_nic && !has_host_dev) {
+        if (has_nic && !has_host_dev && !qtest_enabled()) {
             warn_report("hub %d is not connected to host network", hub->id);
         }
     }

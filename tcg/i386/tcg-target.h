@@ -31,9 +31,11 @@
 #ifdef __x86_64__
 # define TCG_TARGET_REG_BITS  64
 # define TCG_TARGET_NB_REGS   32
+# define MAX_CODE_GEN_BUFFER_SIZE  (2 * GiB)
 #else
 # define TCG_TARGET_REG_BITS  32
 # define TCG_TARGET_NB_REGS   24
+# define MAX_CODE_GEN_BUFFER_SIZE  UINT32_MAX
 #endif
 
 typedef enum {
@@ -84,10 +86,12 @@ typedef enum {
     TCG_REG_RBP = TCG_REG_EBP,
     TCG_REG_RSI = TCG_REG_ESI,
     TCG_REG_RDI = TCG_REG_EDI,
+
+    TCG_AREG0 = TCG_REG_EBP,
+    TCG_REG_CALL_STACK = TCG_REG_ESP
 } TCGReg;
 
 /* used for function call generation */
-#define TCG_REG_CALL_STACK TCG_REG_ESP 
 #define TCG_TARGET_STACK_ALIGN 16
 #if defined(_WIN64)
 #define TCG_TARGET_CALL_STACK_OFFSET 32
@@ -99,6 +103,11 @@ extern bool have_bmi1;
 extern bool have_popcnt;
 extern bool have_avx1;
 extern bool have_avx2;
+extern bool have_avx512bw;
+extern bool have_avx512dq;
+extern bool have_avx512vbmi2;
+extern bool have_avx512vl;
+extern bool have_movbe;
 
 /* optional instructions */
 #define TCG_TARGET_HAS_div2_i32         1
@@ -122,6 +131,7 @@ extern bool have_avx2;
 #define TCG_TARGET_HAS_deposit_i32      1
 #define TCG_TARGET_HAS_extract_i32      1
 #define TCG_TARGET_HAS_sextract_i32     1
+#define TCG_TARGET_HAS_extract2_i32     1
 #define TCG_TARGET_HAS_movcond_i32      1
 #define TCG_TARGET_HAS_add2_i32         1
 #define TCG_TARGET_HAS_sub2_i32         1
@@ -129,12 +139,12 @@ extern bool have_avx2;
 #define TCG_TARGET_HAS_muls2_i32        1
 #define TCG_TARGET_HAS_muluh_i32        0
 #define TCG_TARGET_HAS_mulsh_i32        0
-#define TCG_TARGET_HAS_goto_ptr         1
 #define TCG_TARGET_HAS_direct_jump      1
 
 #if TCG_TARGET_REG_BITS == 64
-#define TCG_TARGET_HAS_extrl_i64_i32    0
-#define TCG_TARGET_HAS_extrh_i64_i32    0
+/* Keep target addresses zero-extended in a register.  */
+#define TCG_TARGET_HAS_extrl_i64_i32    (TARGET_LONG_BITS == 32)
+#define TCG_TARGET_HAS_extrh_i64_i32    (TARGET_LONG_BITS == 32)
 #define TCG_TARGET_HAS_div2_i64         1
 #define TCG_TARGET_HAS_rot_i64          1
 #define TCG_TARGET_HAS_ext8s_i64        1
@@ -159,6 +169,7 @@ extern bool have_avx2;
 #define TCG_TARGET_HAS_deposit_i64      1
 #define TCG_TARGET_HAS_extract_i64      1
 #define TCG_TARGET_HAS_sextract_i64     0
+#define TCG_TARGET_HAS_extract2_i64     1
 #define TCG_TARGET_HAS_movcond_i64      1
 #define TCG_TARGET_HAS_add2_i64         1
 #define TCG_TARGET_HAS_sub2_i64         1
@@ -166,6 +177,9 @@ extern bool have_avx2;
 #define TCG_TARGET_HAS_muls2_i64        1
 #define TCG_TARGET_HAS_muluh_i64        0
 #define TCG_TARGET_HAS_mulsh_i64        0
+#define TCG_TARGET_HAS_qemu_st8_i32     0
+#else
+#define TCG_TARGET_HAS_qemu_st8_i32     1
 #endif
 
 /* We do not support older SSE systems, only beginning with AVX1.  */
@@ -174,14 +188,24 @@ extern bool have_avx2;
 #define TCG_TARGET_HAS_v256             have_avx2
 
 #define TCG_TARGET_HAS_andc_vec         1
-#define TCG_TARGET_HAS_orc_vec          0
-#define TCG_TARGET_HAS_not_vec          0
+#define TCG_TARGET_HAS_orc_vec          have_avx512vl
+#define TCG_TARGET_HAS_nand_vec         have_avx512vl
+#define TCG_TARGET_HAS_nor_vec          have_avx512vl
+#define TCG_TARGET_HAS_eqv_vec          have_avx512vl
+#define TCG_TARGET_HAS_not_vec          have_avx512vl
 #define TCG_TARGET_HAS_neg_vec          0
+#define TCG_TARGET_HAS_abs_vec          1
+#define TCG_TARGET_HAS_roti_vec         have_avx512vl
+#define TCG_TARGET_HAS_rots_vec         0
+#define TCG_TARGET_HAS_rotv_vec         have_avx512vl
 #define TCG_TARGET_HAS_shi_vec          1
-#define TCG_TARGET_HAS_shs_vec          0
-#define TCG_TARGET_HAS_shv_vec          0
-#define TCG_TARGET_HAS_cmp_vec          1
+#define TCG_TARGET_HAS_shs_vec          1
+#define TCG_TARGET_HAS_shv_vec          have_avx2
 #define TCG_TARGET_HAS_mul_vec          1
+#define TCG_TARGET_HAS_sat_vec          1
+#define TCG_TARGET_HAS_minmax_vec       1
+#define TCG_TARGET_HAS_bitsel_vec       have_avx512vl
+#define TCG_TARGET_HAS_cmpsel_vec       -1
 
 #define TCG_TARGET_deposit_i32_valid(ofs, len) \
     (((ofs) == 0 && (len) == 8) || ((ofs) == 8 && (len) == 8) || \
@@ -194,21 +218,11 @@ extern bool have_avx2;
 #define TCG_TARGET_extract_i64_valid(ofs, len) \
     (((ofs) == 8 && (len) == 8) || ((ofs) + (len)) == 32)
 
-#if TCG_TARGET_REG_BITS == 64
-# define TCG_AREG0 TCG_REG_R14
-#else
-# define TCG_AREG0 TCG_REG_EBP
-#endif
-
-static inline void flush_icache_range(uintptr_t start, uintptr_t stop)
-{
-}
-
-static inline void tb_target_set_jmp_target(uintptr_t tc_ptr,
-                                            uintptr_t jmp_addr, uintptr_t addr)
+static inline void tb_target_set_jmp_target(uintptr_t tc_ptr, uintptr_t jmp_rx,
+                                            uintptr_t jmp_rw, uintptr_t addr)
 {
     /* patch the branch destination */
-    atomic_set((int32_t *)jmp_addr, addr - (jmp_addr + 4));
+    qatomic_set((int32_t *)jmp_rw, addr - (jmp_rx + 4));
     /* no need to flush icache explicitly */
 }
 
@@ -219,13 +233,13 @@ static inline void tb_target_set_jmp_target(uintptr_t tc_ptr,
  * The x86 has a pretty strong memory ordering which only really
  * allows for some stores to be re-ordered after loads.
  */
-#include "tcg-mo.h"
+#include "tcg/tcg-mo.h"
 
 #define TCG_TARGET_DEFAULT_MO (TCG_MO_ALL & ~TCG_MO_ST_LD)
 
-#ifdef CONFIG_SOFTMMU
+#define TCG_TARGET_HAS_MEMORY_BSWAP  have_movbe
+
 #define TCG_TARGET_NEED_LDST_LABELS
-#endif
 #define TCG_TARGET_NEED_POOL_LABELS
 
 #endif

@@ -12,6 +12,8 @@
 #ifndef IPLB_H
 #define IPLB_H
 
+#define LOADPARM_LEN    8
+
 struct IplBlockCcw {
     uint8_t  reserved0[85];
     uint8_t  ssid;
@@ -61,7 +63,7 @@ struct IplParameterBlock {
     uint8_t  pbt;
     uint8_t  flags;
     uint16_t reserved01;
-    uint8_t  loadparm[8];
+    uint8_t  loadparm[LOADPARM_LEN];
     union {
         IplBlockCcw ccw;
         IplBlockFcp fcp;
@@ -79,7 +81,7 @@ extern IplParameterBlock iplb __attribute__((__aligned__(PAGE_SIZE)));
 #define QIPL_FLAG_BM_OPTS_ZIPL  0x40
 
 /*
- * This definition must be kept in sync with the defininition
+ * This definition must be kept in sync with the definition
  * in hw/s390x/ipl.h
  */
 struct QemuIplParameters {

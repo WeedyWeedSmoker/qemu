@@ -28,6 +28,8 @@
 
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_bus.h"
+#include "hw/cxl/cxl.h"
+#include "qom/object.h"
 
 typedef struct PCIBridgeWindows PCIBridgeWindows;
 
@@ -50,7 +52,7 @@ struct PCIBridgeWindows {
 };
 
 #define TYPE_PCI_BRIDGE "base-pci-bridge"
-#define PCI_BRIDGE(obj) OBJECT_CHECK(PCIBridge, (obj), TYPE_PCI_BRIDGE)
+OBJECT_DECLARE_SIMPLE_TYPE(PCIBridge, PCI_BRIDGE)
 
 struct PCIBridge {
     /*< private >*/
@@ -79,6 +81,25 @@ struct PCIBridge {
 #define PCI_BRIDGE_DEV_PROP_CHASSIS_NR "chassis_nr"
 #define PCI_BRIDGE_DEV_PROP_MSI        "msi"
 #define PCI_BRIDGE_DEV_PROP_SHPC       "shpc"
+typedef struct CXLHost CXLHost;
+
+struct PXBDev {
+    /*< private >*/
+    PCIDevice parent_obj;
+    /*< public >*/
+
+    uint8_t bus_nr;
+    uint16_t numa_node;
+    bool bypass_iommu;
+    struct cxl_dev {
+        CXLHost *cxl_host_bridge; /* Pointer to a CXLHost */
+    } cxl;
+};
+
+typedef struct PXBDev PXBDev;
+#define TYPE_PXB_CXL_DEVICE "pxb-cxl"
+DECLARE_INSTANCE_CHECKER(PXBDev, PXB_CXL_DEV,
+                         TYPE_PXB_CXL_DEVICE)
 
 int pci_bridge_ssvid_init(PCIDevice *dev, uint8_t offset,
                           uint16_t svid, uint16_t ssid,
@@ -99,10 +120,16 @@ void pci_bridge_reset(DeviceState *qdev);
 void pci_bridge_initfn(PCIDevice *pci_dev, const char *typename);
 void pci_bridge_exitfn(PCIDevice *pci_dev);
 
+void pci_bridge_dev_plug_cb(HotplugHandler *hotplug_dev, DeviceState *dev,
+                            Error **errp);
+void pci_bridge_dev_unplug_cb(HotplugHandler *hotplug_dev, DeviceState *dev,
+                              Error **errp);
+void pci_bridge_dev_unplug_request_cb(HotplugHandler *hotplug_dev,
+                                      DeviceState *dev, Error **errp);
 
 /*
  * before qdev initialization(qdev_init()), this function sets bus_name and
- * map_irq callback which are necessry for pci_bridge_initfn() to
+ * map_irq callback which are necessary for pci_bridge_initfn() to
  * initialize bus.
  */
 void pci_bridge_map_irq(PCIBridge *br, const char* bus_name,
@@ -131,13 +158,29 @@ typedef struct PCIBridgeQemuCap {
     uint64_t mem_pref_64; /* Prefetchable memory to reserve (64-bit MMIO) */
 } PCIBridgeQemuCap;
 
+#define REDHAT_PCI_CAP_TYPE_OFFSET      3
 #define REDHAT_PCI_CAP_RESOURCE_RESERVE 1
 
+/*
+ * PCI BUS/IO/MEM/PREFMEM additional resources recorded as a
+ * capability in PCI configuration space to reserve on firmware init.
+ */
+typedef struct PCIResReserve {
+    uint32_t bus;
+    uint64_t io;
+    uint64_t mem_non_pref;
+    uint64_t mem_pref_32;
+    uint64_t mem_pref_64;
+} PCIResReserve;
+
+#define REDHAT_PCI_CAP_RES_RESERVE_BUS_RES     4
+#define REDHAT_PCI_CAP_RES_RESERVE_IO          8
+#define REDHAT_PCI_CAP_RES_RESERVE_MEM         16
+#define REDHAT_PCI_CAP_RES_RESERVE_PREF_MEM_32 20
+#define REDHAT_PCI_CAP_RES_RESERVE_PREF_MEM_64 24
+#define REDHAT_PCI_CAP_RES_RESERVE_CAP_SIZE    32
+
 int pci_bridge_qemu_reserve_cap_init(PCIDevice *dev, int cap_offset,
-                              uint32_t bus_reserve, uint64_t io_reserve,
-                              uint64_t mem_non_pref_reserve,
-                              uint64_t mem_pref_32_reserve,
-                              uint64_t mem_pref_64_reserve,
-                              Error **errp);
+                               PCIResReserve res_reserve, Error **errp);
 
 #endif /* QEMU_PCI_BRIDGE_H */

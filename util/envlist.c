@@ -1,5 +1,4 @@
 #include "qemu/osdep.h"
-#include "qemu-common.h"
 #include "qemu/queue.h"
 #include "qemu/envlist.h"
 
@@ -218,7 +217,7 @@ envlist_to_environ(const envlist_t *envlist, size_t *count)
 	struct envlist_entry *entry;
 	char **env, **penv;
 
-	penv = env = g_malloc((envlist->el_count + 1) * sizeof(char *));
+	penv = env = g_new(char *, envlist->el_count + 1);
 
 	for (entry = envlist->el_entries.lh_first; entry != NULL;
 	    entry = entry->ev_link.le_next) {

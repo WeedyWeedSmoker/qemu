@@ -85,6 +85,7 @@ static int vhost_user_start(int queues, NetClientState *ncs[],
         options.net_backend = ncs[i];
         options.opaque      = be;
         options.busyloop_timeout = 0;
+        options.nvqs = 2;
         net = vhost_net_init(&options);
         if (!net) {
             error_report("failed to init vhost_net for queue %d", i);
@@ -172,6 +173,17 @@ static void net_vhost_user_cleanup(NetClientState *nc)
     qemu_purge_queued_packets(nc);
 }
 
+static int vhost_user_set_vnet_endianness(NetClientState *nc,
+                                          bool enable)
+{
+    /* Nothing to do.  If the server supports
+     * VHOST_USER_PROTOCOL_F_CROSS_ENDIAN, it will get the
+     * vnet header endianness from there.  If it doesn't, negotiation
+     * fails.
+     */
+    return 0;
+}
+
 static bool vhost_user_has_vnet_hdr(NetClientState *nc)
 {
     assert(nc->info->type == NET_CLIENT_DRIVER_VHOST_USER);
@@ -186,6 +198,19 @@ static bool vhost_user_has_ufo(NetClientState *nc)
     return true;
 }
 
+static bool vhost_user_check_peer_type(NetClientState *nc, ObjectClass *oc,
+                                       Error **errp)
+{
+    const char *driver = object_class_get_name(oc);
+
+    if (!g_str_has_prefix(driver, "virtio-net-")) {
+        error_setg(errp, "vhost-user requires frontend driver virtio-net-*");
+        return false;
+    }
+
+    return true;
+}
+
 static NetClientInfo net_vhost_user_info = {
         .type = NET_CLIENT_DRIVER_VHOST_USER,
         .size = sizeof(NetVhostUserState),
@@ -193,10 +218,13 @@ static NetClientInfo net_vhost_user_info = {
         .cleanup = net_vhost_user_cleanup,
         .has_vnet_hdr = vhost_user_has_vnet_hdr,
         .has_ufo = vhost_user_has_ufo,
+        .set_vnet_be = vhost_user_set_vnet_endianness,
+        .set_vnet_le = vhost_user_set_vnet_endianness,
+        .check_peer_type = vhost_user_check_peer_type,
 };
 
-static gboolean net_vhost_user_watch(GIOChannel *chan, GIOCondition cond,
-                                           void *opaque)
+static gboolean net_vhost_user_watch(void *do_not_use, GIOCondition cond,
+                                     void *opaque)
 {
     NetVhostUserState *s = opaque;
 
@@ -205,7 +233,7 @@ static gboolean net_vhost_user_watch(GIOChannel *chan, GIOCondition cond,
     return TRUE;
 }
 
-static void net_vhost_user_event(void *opaque, int event);
+static void net_vhost_user_event(void *opaque, QEMUChrEvent event);
 
 static void chr_closed_bh(void *opaque)
 {
@@ -213,7 +241,7 @@ static void chr_closed_bh(void *opaque)
     NetClientState *ncs[MAX_QUEUE_NUM];
     NetVhostUserState *s;
     Error *err = NULL;
-    int queues;
+    int queues, i;
 
     queues = qemu_find_net_clients_except(name, ncs,
                                           NET_CLIENT_DRIVER_NIC,
@@ -222,8 +250,15 @@ static void chr_closed_bh(void *opaque)
 
     s = DO_UPCAST(NetVhostUserState, nc, ncs[0]);
 
+    for (i = queues -1; i >= 0; i--) {
+        s = DO_UPCAST(NetVhostUserState, nc, ncs[i]);
+
+        if (s->vhost_net) {
+            s->acked_features = vhost_net_get_acked_features(s->vhost_net);
+        }
+    }
+
     qmp_set_link(name, false, &err);
-    vhost_user_stop(queues, ncs);
 
     qemu_chr_fe_set_handlers(&s->chr, NULL, NULL, net_vhost_user_event,
                              NULL, opaque, NULL, true);
@@ -233,7 +268,7 @@ static void chr_closed_bh(void *opaque)
     }
 }
 
-static void net_vhost_user_event(void *opaque, int event)
+static void net_vhost_user_event(void *opaque, QEMUChrEvent event)
 {
     const char *name = opaque;
     NetClientState *ncs[MAX_QUEUE_NUM];
@@ -278,6 +313,11 @@ static void net_vhost_user_event(void *opaque, int event)
             aio_bh_schedule_oneshot(ctx, chr_closed_bh, opaque);
         }
         break;
+    case CHR_EVENT_BREAK:
+    case CHR_EVENT_MUX_IN:
+    case CHR_EVENT_MUX_OUT:
+        /* Ignore */
+        break;
     }
 
     if (err) {
@@ -291,32 +331,26 @@ static int net_vhost_user_init(NetClientState *peer, const char *device,
 {
     Error *err = NULL;
     NetClientState *nc, *nc0 = NULL;
-    VhostUserState *user = NULL;
     NetVhostUserState *s = NULL;
+    VhostUserState *user;
     int i;
 
     assert(name);
     assert(queues > 0);
 
-    user = vhost_user_init();
-    if (!user) {
-        error_report("failed to init vhost_user");
-        goto err;
-    }
-
+    user = g_new0(struct VhostUserState, 1);
     for (i = 0; i < queues; i++) {
         nc = qemu_new_net_client(&net_vhost_user_info, peer, device, name);
-        snprintf(nc->info_str, sizeof(nc->info_str), "vhost-user%d to %s",
-                 i, chr->label);
+        qemu_set_info_str(nc, "vhost-user%d to %s", i, chr->label);
         nc->queue_index = i;
         if (!nc0) {
             nc0 = nc;
             s = DO_UPCAST(NetVhostUserState, nc, nc);
-            if (!qemu_chr_fe_init(&s->chr, chr, &err)) {
+            if (!qemu_chr_fe_init(&s->chr, chr, &err) ||
+                !vhost_user_init(user, &s->chr, &err)) {
                 error_report_err(err);
                 goto err;
             }
-            user->chr = &s->chr;
         }
         s = DO_UPCAST(NetVhostUserState, nc, nc);
         s->vhost_user = user;
@@ -376,27 +410,6 @@ static Chardev *net_vhost_claim_chardev(
     return chr;
 }
 
-static int net_vhost_check_net(void *opaque, QemuOpts *opts, Error **errp)
-{
-    const char *name = opaque;
-    const char *driver, *netdev;
-
-    driver = qemu_opt_get(opts, "driver");
-    netdev = qemu_opt_get(opts, "netdev");
-
-    if (!driver || !netdev) {
-        return 0;
-    }
-
-    if (strcmp(netdev, name) == 0 &&
-        !g_str_has_prefix(driver, "virtio-net-")) {
-        error_setg(errp, "vhost-user requires frontend driver virtio-net-*");
-        return -1;
-    }
-
-    return 0;
-}
-
 int net_init_vhost_user(const Netdev *netdev, const char *name,
                         NetClientState *peer, Error **errp)
 {
@@ -409,12 +422,6 @@ int net_init_vhost_user(const Netdev *netdev, const char *name,
 
     chr = net_vhost_claim_chardev(vhost_user_opts, errp);
     if (!chr) {
-        return -1;
-    }
-
-    /* verify net frontend */
-    if (qemu_opts_foreach(qemu_find_opts("device"), net_vhost_check_net,
-                          (char *)name, errp)) {
         return -1;
     }
 

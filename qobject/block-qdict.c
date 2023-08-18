@@ -97,7 +97,7 @@ static void qdict_flatten_qdict(QDict *qdict, QDict *target, const char *prefix)
     const QDictEntry *entry, *next;
     QDict *dict_val;
     QList *list_val;
-    char *new_key;
+    char *key, *new_key;
 
     entry = qdict_first(qdict);
 
@@ -106,27 +106,38 @@ static void qdict_flatten_qdict(QDict *qdict, QDict *target, const char *prefix)
         value = qdict_entry_value(entry);
         dict_val = qobject_to(QDict, value);
         list_val = qobject_to(QList, value);
-        new_key = NULL;
 
         if (prefix) {
-            new_key = g_strdup_printf("%s.%s", prefix, entry->key);
+            key = new_key = g_strdup_printf("%s.%s", prefix, entry->key);
+        } else {
+            key = entry->key;
+            new_key = NULL;
         }
 
         /*
          * Flatten non-empty QDict and QList recursively into @target,
-         * copy other objects to @target
+         * copy other objects to @target.
+         * On the root level (if @qdict == @target), remove flattened
+         * nested QDicts and QLists from @qdict.
+         *
+         * (Note that we do not need to remove entries from nested
+         * dicts or lists.  Their reference count is decremented on
+         * the root level, so there are no leaks.  In fact, if they
+         * have a reference count greater than one, we are probably
+         * well advised not to modify them altogether.)
          */
         if (dict_val && qdict_size(dict_val)) {
-            qdict_flatten_qdict(dict_val, target,
-                                new_key ? new_key : entry->key);
-            qdict_del(qdict, entry->key);
+            qdict_flatten_qdict(dict_val, target, key);
+            if (target == qdict) {
+                qdict_del(qdict, entry->key);
+            }
         } else if (list_val && !qlist_empty(list_val)) {
-            qdict_flatten_qlist(list_val, target,
-                                new_key ? new_key : entry->key);
-            qdict_del(qdict, entry->key);
+            qdict_flatten_qlist(list_val, target, key);
+            if (target == qdict) {
+                qdict_del(qdict, entry->key);
+            }
         } else if (target != qdict) {
-            qdict_put_obj(target, new_key, qobject_ref(value));
-            qdict_del(qdict, entry->key);
+            qdict_put_obj(target, key, qobject_ref(value));
         }
 
         g_free(new_key);
@@ -147,20 +158,25 @@ void qdict_flatten(QDict *qdict)
     qdict_flatten_qdict(qdict, qdict, NULL);
 }
 
-/* extract all the src QDict entries starting by start into dst */
+/* extract all the src QDict entries starting by start into dst.
+ * If dst is NULL then the entries are simply removed from src. */
 void qdict_extract_subqdict(QDict *src, QDict **dst, const char *start)
 
 {
     const QDictEntry *entry, *next;
     const char *p;
 
-    *dst = qdict_new();
+    if (dst) {
+        *dst = qdict_new();
+    }
     entry = qdict_first(src);
 
     while (entry != NULL) {
         next = qdict_next(src, entry);
         if (strstart(entry->key, start, &p)) {
-            qdict_put_obj(*dst, p, qobject_ref(entry->value));
+            if (dst) {
+                qdict_put_obj(*dst, p, qobject_ref(entry->value));
+            }
             qdict_del(src, entry->key);
         }
         entry = next;
@@ -235,12 +251,12 @@ void qdict_array_split(QDict *src, QList **dst)
         if (is_subqdict) {
             qdict_extract_subqdict(src, &subqdict, prefix);
             assert(qdict_size(subqdict) > 0);
+            qlist_append_obj(*dst, QOBJECT(subqdict));
         } else {
             qobject_ref(subqobj);
             qdict_del(src, indexstr);
+            qlist_append_obj(*dst, subqobj);
         }
-
-        qlist_append_obj(*dst, subqobj ?: QOBJECT(subqdict));
     }
 }
 
@@ -561,7 +577,7 @@ static QObject *qdict_crumple_for_keyval_qiv(QDict *src, Error **errp)
         if (!tmp) {
             tmp = qdict_clone_shallow(src);
         }
-        qdict_put(tmp, ent->key, qstring_from_str(s));
+        qdict_put_str(tmp, ent->key, s);
         g_free(buf);
     }
 

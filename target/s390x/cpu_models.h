@@ -14,8 +14,8 @@
 #define TARGET_S390X_CPU_MODELS_H
 
 #include "cpu_features.h"
-#include "gen-features.h"
-#include "qom/cpu.h"
+#include "target/s390x/gen-features.h"
+#include "hw/core/cpu.h"
 
 /* static CPU definition */
 struct S390CPUDef {
@@ -24,13 +24,13 @@ struct S390CPUDef {
     uint8_t gen;            /* hw generation identification */
     uint16_t type;          /* cpu type identification */
     uint8_t ec_ga;          /* EC GA version (on which also the BC is based) */
-    uint8_t mha_pow;        /* Maximum Host Adress Power, mha = 2^pow-1 */
+    uint8_t mha_pow;        /* maximum host address power, mha = 2^pow-1 */
     uint32_t hmfai;         /* hypervisor-managed facilities */
     /* base/min features, must never be changed between QEMU versions */
     S390FeatBitmap base_feat;
     /* used to init base_feat from generated data */
     S390FeatInit base_init;
-    /* deafault features, QEMU version specific */
+    /* default features, QEMU version specific */
     S390FeatBitmap default_feat;
     /* used to init default_feat from generated data */
     S390FeatInit default_init;
@@ -75,6 +75,8 @@ struct S390CPUModel {
 
 void s390_cpudef_featoff(uint8_t gen, uint8_t ec_ga, S390Feat feat);
 void s390_cpudef_featoff_greater(uint8_t gen, uint8_t ec_ga, S390Feat feat);
+void s390_cpudef_group_featoff_greater(uint8_t gen, uint8_t ec_ga,
+                                       S390FeatGroup group);
 uint32_t s390_get_hmfai(void);
 uint8_t s390_get_mha_pow(void);
 uint32_t s390_get_ibc_val(void);

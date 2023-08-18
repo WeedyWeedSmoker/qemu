@@ -4,20 +4,17 @@
 #ifndef CONFIG_USER_ONLY
 
 #ifdef TARGET_PPC64
-void dump_slb(FILE *f, fprintf_function cpu_fprintf, PowerPCCPU *cpu);
+void dump_slb(PowerPCCPU *cpu);
 int ppc_store_slb(PowerPCCPU *cpu, target_ulong slot,
                   target_ulong esid, target_ulong vsid);
-hwaddr ppc_hash64_get_phys_page_debug(PowerPCCPU *cpu, target_ulong addr);
-int ppc_hash64_handle_mmu_fault(PowerPCCPU *cpu, vaddr address, int rw,
-                                int mmu_idx);
-void ppc_hash64_store_hpte(PowerPCCPU *cpu, hwaddr ptex,
-                           uint64_t pte0, uint64_t pte1);
+bool ppc_hash64_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
+                      hwaddr *raddrp, int *psizep, int *protp, int mmu_idx,
+                      bool guest_visible);
 void ppc_hash64_tlb_flush_hpte(PowerPCCPU *cpu,
                                target_ulong pte_index,
                                target_ulong pte0, target_ulong pte1);
 unsigned ppc_hash64_hpte_page_shift_noslb(PowerPCCPU *cpu,
                                           uint64_t pte0, uint64_t pte1);
-void ppc_store_lpcr(PowerPCCPU *cpu, target_ulong val);
 void ppc_hash64_init(PowerPCCPU *cpu);
 void ppc_hash64_finalize(PowerPCCPU *cpu);
 #endif
@@ -60,6 +57,7 @@ void ppc_hash64_finalize(PowerPCCPU *cpu);
 #define SDR_64_HTABORG         0x0FFFFFFFFFFC0000ULL
 #define SDR_64_HTABSIZE        0x000000000000001FULL
 
+#define PATE0_HTABORG           0x0FFFFFFFFFFC0000ULL
 #define HPTES_PER_GROUP         8
 #define HASH_PTE_SIZE_64        16
 #define HASH_PTEG_SIZE_64       (HASH_PTE_SIZE_64 * HPTES_PER_GROUP)
@@ -99,23 +97,15 @@ void ppc_hash64_finalize(PowerPCCPU *cpu);
 #define HPTE64_V_1TB_SEG        0x4000000000000000ULL
 #define HPTE64_V_VRMA_MASK      0x4001ffffff000000ULL
 
-static inline hwaddr ppc_hash64_hpt_base(PowerPCCPU *cpu)
-{
-    if (cpu->vhyp) {
-        return 0;
-    }
-    return cpu->env.spr[SPR_SDR1] & SDR_64_HTABORG;
-}
+/* PTE offsets */
+#define HPTE64_DW1              (HASH_PTE_SIZE_64 / 2)
+#define HPTE64_DW1_R            (HPTE64_DW1 + 6)
+#define HPTE64_DW1_C            (HPTE64_DW1 + 7)
 
-static inline hwaddr ppc_hash64_hpt_mask(PowerPCCPU *cpu)
-{
-    if (cpu->vhyp) {
-        PPCVirtualHypervisorClass *vhc =
-            PPC_VIRTUAL_HYPERVISOR_GET_CLASS(cpu->vhyp);
-        return vhc->hpt_mask(cpu->vhyp);
-    }
-    return (1ULL << ((cpu->env.spr[SPR_SDR1] & SDR_64_HTABSIZE) + 18 - 7)) - 1;
-}
+/* Format changes for ARCH v3 */
+#define HPTE64_V_COMMON_BITS    0x000fffffffffffffULL
+#define HPTE64_R_3_0_SSIZE_SHIFT 58
+#define HPTE64_R_3_0_SSIZE_MASK (3ULL << HPTE64_R_3_0_SSIZE_SHIFT)
 
 struct ppc_hash_pte64 {
     uint64_t pte0, pte1;

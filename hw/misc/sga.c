@@ -24,22 +24,26 @@
  * sgabios code originally available at code.google.com/p/sgabios
  *
  */
+
 #include "qemu/osdep.h"
 #include "hw/isa/isa.h"
 #include "hw/loader.h"
-#include "sysemu/sysemu.h"
+#include "qemu/module.h"
+#include "qom/object.h"
+#include "qemu/error-report.h"
 
 #define SGABIOS_FILENAME "sgabios.bin"
 
 #define TYPE_SGA "sga"
-#define SGA(obj) OBJECT_CHECK(ISASGAState, (obj), TYPE_SGA)
+OBJECT_DECLARE_SIMPLE_TYPE(ISASGAState, SGA)
 
-typedef struct ISASGAState {
+struct ISASGAState {
     ISADevice parent_obj;
-} ISASGAState;
+};
 
 static void sga_realizefn(DeviceState *dev, Error **errp)
 {
+    warn_report("-device sga is deprecated, use -machine graphics=off");
     rom_add_vga(SGABIOS_FILENAME);
 }
 

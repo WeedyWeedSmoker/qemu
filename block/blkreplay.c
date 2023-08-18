@@ -10,7 +10,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu-common.h"
+#include "qemu/module.h"
 #include "block/block_int.h"
 #include "sysemu/replay.h"
 #include "qapi/error.h"
@@ -23,15 +23,11 @@ typedef struct Request {
 static int blkreplay_open(BlockDriverState *bs, QDict *options, int flags,
                           Error **errp)
 {
-    Error *local_err = NULL;
     int ret;
 
     /* Open the image file */
-    bs->file = bdrv_open_child(NULL, options, "image",
-                               bs, &child_file, false, &local_err);
-    if (local_err) {
-        ret = -EINVAL;
-        error_propagate(errp, local_err);
+    ret = bdrv_open_file_child(NULL, options, "image", bs, errp);
+    if (ret < 0) {
         goto fail;
     }
 
@@ -41,10 +37,6 @@ static int blkreplay_open(BlockDriverState *bs, QDict *options, int flags,
     ret = 0;
 fail:
     return ret;
-}
-
-static void blkreplay_close(BlockDriverState *bs)
-{
 }
 
 static int64_t blkreplay_getlength(BlockDriverState *bs)
@@ -77,7 +69,7 @@ static void block_request_create(uint64_t reqid, BlockDriverState *bs,
 }
 
 static int coroutine_fn blkreplay_co_preadv(BlockDriverState *bs,
-    uint64_t offset, uint64_t bytes, QEMUIOVector *qiov, int flags)
+    int64_t offset, int64_t bytes, QEMUIOVector *qiov, BdrvRequestFlags flags)
 {
     uint64_t reqid = blkreplay_next_id();
     int ret = bdrv_co_preadv(bs->file, offset, bytes, qiov, flags);
@@ -88,7 +80,7 @@ static int coroutine_fn blkreplay_co_preadv(BlockDriverState *bs,
 }
 
 static int coroutine_fn blkreplay_co_pwritev(BlockDriverState *bs,
-    uint64_t offset, uint64_t bytes, QEMUIOVector *qiov, int flags)
+    int64_t offset, int64_t bytes, QEMUIOVector *qiov, BdrvRequestFlags flags)
 {
     uint64_t reqid = blkreplay_next_id();
     int ret = bdrv_co_pwritev(bs->file, offset, bytes, qiov, flags);
@@ -99,7 +91,7 @@ static int coroutine_fn blkreplay_co_pwritev(BlockDriverState *bs,
 }
 
 static int coroutine_fn blkreplay_co_pwrite_zeroes(BlockDriverState *bs,
-    int64_t offset, int bytes, BdrvRequestFlags flags)
+    int64_t offset, int64_t bytes, BdrvRequestFlags flags)
 {
     uint64_t reqid = blkreplay_next_id();
     int ret = bdrv_co_pwrite_zeroes(bs->file, offset, bytes, flags);
@@ -110,10 +102,10 @@ static int coroutine_fn blkreplay_co_pwrite_zeroes(BlockDriverState *bs,
 }
 
 static int coroutine_fn blkreplay_co_pdiscard(BlockDriverState *bs,
-                                              int64_t offset, int bytes)
+                                              int64_t offset, int64_t bytes)
 {
     uint64_t reqid = blkreplay_next_id();
-    int ret = bdrv_co_pdiscard(bs->file->bs, offset, bytes);
+    int ret = bdrv_co_pdiscard(bs->file, offset, bytes);
     block_request_create(reqid, bs, qemu_coroutine_self());
     qemu_coroutine_yield();
 
@@ -130,13 +122,19 @@ static int coroutine_fn blkreplay_co_flush(BlockDriverState *bs)
     return ret;
 }
 
+static int blkreplay_snapshot_goto(BlockDriverState *bs,
+                                   const char *snapshot_id)
+{
+    return bdrv_snapshot_goto(bs->file->bs, snapshot_id, NULL);
+}
+
 static BlockDriver bdrv_blkreplay = {
     .format_name            = "blkreplay",
     .instance_size          = 0,
+    .is_filter              = true,
 
     .bdrv_open              = blkreplay_open,
-    .bdrv_close             = blkreplay_close,
-    .bdrv_child_perm        = bdrv_filter_default_perms,
+    .bdrv_child_perm        = bdrv_default_perms,
     .bdrv_getlength         = blkreplay_getlength,
 
     .bdrv_co_preadv         = blkreplay_co_preadv,
@@ -145,6 +143,8 @@ static BlockDriver bdrv_blkreplay = {
     .bdrv_co_pwrite_zeroes  = blkreplay_co_pwrite_zeroes,
     .bdrv_co_pdiscard       = blkreplay_co_pdiscard,
     .bdrv_co_flush          = blkreplay_co_flush,
+
+    .bdrv_snapshot_goto     = blkreplay_snapshot_goto,
 };
 
 static void bdrv_blkreplay_init(void)

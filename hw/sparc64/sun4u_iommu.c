@@ -29,6 +29,7 @@
 #include "hw/sparc/sun4u_iommu.h"
 #include "exec/address-spaces.h"
 #include "qemu/log.h"
+#include "qemu/module.h"
 #include "trace.h"
 
 
@@ -164,7 +165,7 @@ static IOMMUTLBEntry sun4u_translate_iommu(IOMMUMemoryRegion *iommu,
     }
 
     if (tte & IOMMU_TTE_DATA_W) {
-        /* Writeable */
+        /* Writable */
         ret.perm = IOMMU_RW;
     } else {
         ret.perm = IOMMU_RO;

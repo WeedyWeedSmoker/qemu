@@ -21,15 +21,15 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #include "qemu/osdep.h"
-#include "qemu-common.h"
 #include "qemu/timer.h"
 #include "block/block_int.h"
-#include "qemu/module.h"
 #include "block/aio.h"
 #include "block/raw-aio.h"
 #include "qemu/event_notifier.h"
 #include "qemu/iov.h"
+#include "qemu/memalign.h"
 #include <windows.h>
 #include <winioctl.h>
 
@@ -173,7 +173,7 @@ int win32_aio_attach(QEMUWin32AIOState *aio, HANDLE hfile)
 void win32_aio_detach_aio_context(QEMUWin32AIOState *aio,
                                   AioContext *old_context)
 {
-    aio_set_event_notifier(old_context, &aio->e, false, NULL, NULL);
+    aio_set_event_notifier(old_context, &aio->e, false, NULL, NULL, NULL);
     aio->aio_ctx = NULL;
 }
 
@@ -182,7 +182,7 @@ void win32_aio_attach_aio_context(QEMUWin32AIOState *aio,
 {
     aio->aio_ctx = new_context;
     aio_set_event_notifier(new_context, &aio->e, false,
-                           win32_aio_completion_cb, NULL);
+                           win32_aio_completion_cb, NULL, NULL);
 }
 
 QEMUWin32AIOState *win32_aio_init(void)

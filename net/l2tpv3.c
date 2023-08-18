@@ -28,13 +28,13 @@
 #include <netdb.h>
 #include "net/net.h"
 #include "clients.h"
-#include "qemu-common.h"
+#include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/option.h"
 #include "qemu/sockets.h"
 #include "qemu/iov.h"
 #include "qemu/main-loop.h"
-
+#include "qemu/memalign.h"
 
 /* The buffer size needs to be investigated for optimum numbers and
  * optimum means of paging in on different systems. This size is
@@ -528,7 +528,6 @@ int net_init_l2tpv3(const Netdev *netdev,
                     const char *name,
                     NetClientState *peer, Error **errp)
 {
-    /* FIXME error_setg(errp, ...) on failure */
     const NetdevL2TPv3Options *l2tpv3;
     NetL2TPV3State *s;
     NetClientState *nc;
@@ -555,7 +554,7 @@ int net_init_l2tpv3(const Netdev *netdev,
     }
 
     if ((l2tpv3->has_offset) && (l2tpv3->offset > 256)) {
-        error_report("l2tpv3_open : offset must be less than 256 bytes");
+        error_setg(errp, "offset must be less than 256 bytes");
         goto outerr;
     }
 
@@ -563,6 +562,8 @@ int net_init_l2tpv3(const Netdev *netdev,
         if (l2tpv3->has_rxcookie && l2tpv3->has_txcookie) {
             s->cookie = true;
         } else {
+            error_setg(errp,
+                       "require both 'rxcookie' and 'txcookie' or neither");
             goto outerr;
         }
     } else {
@@ -578,7 +579,7 @@ int net_init_l2tpv3(const Netdev *netdev,
     if (l2tpv3->has_udp && l2tpv3->udp) {
         s->udp = true;
         if (!(l2tpv3->has_srcport && l2tpv3->has_dstport)) {
-            error_report("l2tpv3_open : need both src and dst port for udp");
+            error_setg(errp, "need both src and dst port for udp");
             goto outerr;
         } else {
             srcport = l2tpv3->srcport;
@@ -639,25 +640,23 @@ int net_init_l2tpv3(const Netdev *netdev,
     gairet = getaddrinfo(l2tpv3->src, srcport, &hints, &result);
 
     if ((gairet != 0) || (result == NULL)) {
-        error_report(
-            "l2tpv3_open : could not resolve src, errno = %s",
-            gai_strerror(gairet)
-        );
+        error_setg(errp, "could not resolve src, errno = %s",
+                   gai_strerror(gairet));
         goto outerr;
     }
     fd = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
     if (fd == -1) {
         fd = -errno;
-        error_report("l2tpv3_open : socket creation failed, errno = %d", -fd);
+        error_setg(errp, "socket creation failed, errno = %d",
+                   -fd);
         goto outerr;
     }
     if (bind(fd, (struct sockaddr *) result->ai_addr, result->ai_addrlen)) {
-        error_report("l2tpv3_open :  could not bind socket err=%i", errno);
+        error_setg(errp, "could not bind socket err=%i", errno);
         goto outerr;
     }
-    if (result) {
-        freeaddrinfo(result);
-    }
+
+    freeaddrinfo(result);
 
     memset(&hints, 0, sizeof(hints));
 
@@ -677,10 +676,8 @@ int net_init_l2tpv3(const Netdev *netdev,
     result = NULL;
     gairet = getaddrinfo(l2tpv3->dst, dstport, &hints, &result);
     if ((gairet != 0) || (result == NULL)) {
-        error_report(
-            "l2tpv3_open : could not resolve dst, error = %s",
-            gai_strerror(gairet)
-        );
+        error_setg(errp, "could not resolve dst, error = %s",
+                   gai_strerror(gairet));
         goto outerr;
     }
 
@@ -688,9 +685,7 @@ int net_init_l2tpv3(const Netdev *netdev,
     memcpy(s->dgram_dst, result->ai_addr, result->ai_addrlen);
     s->dst_size = result->ai_addrlen;
 
-    if (result) {
-        freeaddrinfo(result);
-    }
+    freeaddrinfo(result);
 
     if (l2tpv3->has_counter && l2tpv3->counter) {
         s->has_counter = true;
@@ -721,15 +716,14 @@ int net_init_l2tpv3(const Netdev *netdev,
     s->vec = g_new(struct iovec, MAX_L2TPV3_IOVCNT);
     s->header_buf = g_malloc(s->header_size);
 
-    qemu_set_nonblock(fd);
+    qemu_socket_set_nonblock(fd);
 
     s->fd = fd;
     s->counter = 0;
 
     l2tpv3_read_poll(s, true);
 
-    snprintf(s->nc.info_str, sizeof(s->nc.info_str),
-             "l2tpv3: connected");
+    qemu_set_info_str(&s->nc, "l2tpv3: connected");
     return 0;
 outerr:
     qemu_del_net_client(nc);

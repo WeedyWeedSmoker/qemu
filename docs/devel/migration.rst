@@ -37,7 +37,7 @@ over any transport.
 - tcp migration: do the migration using tcp sockets
 - unix migration: do the migration using unix sockets
 - exec migration: do the migration using the stdin/stdout through a process.
-- fd migration: do the migration using an file descriptor that is
+- fd migration: do the migration using a file descriptor that is
   passed to QEMU.  QEMU doesn't care how this file descriptor is opened.
 
 In addition, support is included for migration using RDMA, which
@@ -50,12 +50,33 @@ All these migration protocols use the same infrastructure to
 save/restore state devices.  This infrastructure is shared with the
 savevm/loadvm functionality.
 
+Debugging
+=========
+
+The migration stream can be analyzed thanks to ``scripts/analyze-migration.py``.
+
+Example usage:
+
+.. code-block:: shell
+
+  $ qemu-system-x86_64 -display none -monitor stdio
+  (qemu) migrate "exec:cat > mig"
+  (qemu) q
+  $ ./scripts/analyze-migration.py -f mig
+  {
+    "ram (3)": {
+        "section sizes": {
+            "pc.ram": "0x0000000008000000",
+  ...
+
+See also ``analyze-migration.py -h`` help for more options.
+
 Common infrastructure
 =====================
 
 The files, sockets or fd's that carry the migration stream are abstracted by
-the  ``QEMUFile`` type (see `migration/qemu-file.h`).  In most cases this
-is connected to a subtype of ``QIOChannel`` (see `io/`).
+the  ``QEMUFile`` type (see ``migration/qemu-file.h``).  In most cases this
+is connected to a subtype of ``QIOChannel`` (see ``io/``).
 
 
 Saving the state of one device
@@ -145,14 +166,14 @@ An example (from hw/input/pckbd.c)
   };
 
 We are declaring the state with name "pckbd".
-The `version_id` is 3, and the fields are 4 uint8_t in a KBDState structure.
+The ``version_id`` is 3, and the fields are 4 uint8_t in a KBDState structure.
 We registered this with:
 
 .. code:: c
 
     vmstate_register(NULL, 0, &vmstate_kbd, s);
 
-For devices that are `qdev` based, we can register the device in the class
+For devices that are ``qdev`` based, we can register the device in the class
 init function:
 
 .. code:: c
@@ -183,16 +204,15 @@ another to load the state back.
 
 .. code:: c
 
-  int register_savevm_live(DeviceState *dev,
-                           const char *idstr,
+  int register_savevm_live(const char *idstr,
                            int instance_id,
                            int version_id,
                            SaveVMHandlers *ops,
                            void *opaque);
 
-Two functions in the ``ops`` structure are the `save_state`
-and `load_state` functions.  Notice that `load_state` receives a version_id
-parameter to know what state format is receiving.  `save_state` doesn't
+Two functions in the ``ops`` structure are the ``save_state``
+and ``load_state`` functions.  Notice that ``load_state`` receives a version_id
+parameter to know what state format is receiving.  ``save_state`` doesn't
 have a version_id parameter because it always uses the latest version.
 
 Note that because the VMState macros still save the data in a raw
@@ -240,10 +260,13 @@ should succeed even with the data missing.  To support this the
 subsection can be connected to a device property and from there
 to a versioned machine type.
 
-One important note is that the post_load() function is called "after"
-loading all subsections, because a newer subsection could change same
-value that it uses.  A flag, and the combination of pre_load and post_load
-can be used to detect whether a subsection was loaded, and to
+The 'pre_load' and 'post_load' functions on subsections are only
+called if the subsection is loaded.
+
+One important note is that the outer post_load() function is called "after"
+loading all subsections, because a newer subsection could change the same
+value that it uses.  A flag, and the combination of outer pre_load and
+post_load can be used to detect whether a subsection was loaded, and to
 fall back on default behaviour when the subsection isn't present.
 
 Example:
@@ -311,12 +334,12 @@ For example:
 
    a) Add a new property using ``DEFINE_PROP_BOOL`` - e.g. support-foo and
       default it to true.
-   b) Add an entry to the ``HW_COMPAT_`` for the previous version that sets
+   b) Add an entry to the ``hw_compat_`` for the previous version that sets
       the property to false.
    c) Add a static bool  support_foo function that tests the property.
    d) Add a subsection with a .needed set to the support_foo function
-   e) (potentially) Add a pre_load that sets up a default value for 'foo'
-      to be used if the subsection isn't loaded.
+   e) (potentially) Add an outer pre_load that sets up a default value
+      for 'foo' to be used if the subsection isn't loaded.
 
 Now that subsection will not be generated when using an older
 machine type and the migration stream will be accepted by older
@@ -362,23 +385,17 @@ migration of a device, and using them breaks backward-migration
 compatibility; in general most changes can be made by adding Subsections
 (see above) or _TEST macros (see above) which won't break compatibility.
 
-Each version is associated with a series of fields saved.  The `save_state` always saves
-the state as the newer version.  But `load_state` sometimes is able to
+Each version is associated with a series of fields saved.  The ``save_state`` always saves
+the state as the newer version.  But ``load_state`` sometimes is able to
 load state from an older version.
 
-You can see that there are several version fields:
+You can see that there are two version fields:
 
-- `version_id`: the maximum version_id supported by VMState for that device.
-- `minimum_version_id`: the minimum version_id that VMState is able to understand
+- ``version_id``: the maximum version_id supported by VMState for that device.
+- ``minimum_version_id``: the minimum version_id that VMState is able to understand
   for that device.
-- `minimum_version_id_old`: For devices that were not able to port to vmstate, we can
-  assign a function that knows how to read this old state. This field is
-  ignored if there is no `load_state_old` handler.
 
-VMState is able to read versions from minimum_version_id to
-version_id.  And the function ``load_state_old()`` (if present) is able to
-load state from minimum_version_id_old to minimum_version_id.  This
-function is deprecated and will be removed when no more users are left.
+VMState is able to read versions from minimum_version_id to version_id.
 
 There are *_V* forms of many ``VMSTATE_`` macros to load fields for version dependent fields,
 e.g.
@@ -416,8 +433,13 @@ The functions to do that are inside a vmstate definition, and are called:
 
   This function is called before we save the state of one device.
 
-Example: You can look at hpet.c, that uses the three function to
-massage the state that is transferred.
+- ``int (*post_save)(void *opaque);``
+
+  This function is called after we save the state of one device
+  (even upon failure, unless the call to pre_save returned an error).
+
+Example: You can look at hpet.c, that uses the first three functions
+to massage the state that is transferred.
 
 The ``VMSTATE_WITH_TMP`` macro may be useful when the migration
 data doesn't match the stored device data well; it allows an
@@ -426,12 +448,13 @@ data and then transferred to the main structure.
 
 If you use memory API functions that update memory layout outside
 initialization (i.e., in response to a guest action), this is a strong
-indication that you need to call these functions in a `post_load` callback.
+indication that you need to call these functions in a ``post_load`` callback.
 Examples of such memory API functions are:
 
   - memory_region_add_subregion()
   - memory_region_del_subregion()
   - memory_region_set_readonly()
+  - memory_region_set_nonvolatile()
   - memory_region_set_enabled()
   - memory_region_set_address()
   - memory_region_set_alias_offset()
@@ -597,7 +620,7 @@ It can be issued immediately after migration is started or any
 time later on.  Issuing it after the end of a migration is harmless.
 
 Blocktime is a postcopy live migration metric, intended to show how
-long the vCPU was in state of interruptable sleep due to pagefault.
+long the vCPU was in state of interruptible sleep due to pagefault.
 That metric is calculated both for all vCPUs as overlapped value, and
 separately for each vCPU. These values are calculated on destination
 side.  To enable postcopy blocktime calculation, enter following
@@ -612,7 +635,7 @@ time per vCPU.
 
 .. note::
   During the postcopy phase, the bandwidth limits set using
-  ``migrate_set_speed`` is ignored (to avoid delaying requested pages that
+  ``migrate_set_parameter`` is ignored (to avoid delaying requested pages that
   the destination is waiting for).
 
 Postcopy device transfer
@@ -794,12 +817,12 @@ Postcopy migration with shared memory needs explicit support from the other
 processes that share memory and from QEMU. There are restrictions on the type of
 memory that userfault can support shared.
 
-The Linux kernel userfault support works on `/dev/shm` memory and on `hugetlbfs`
-(although the kernel doesn't provide an equivalent to `madvise(MADV_DONTNEED)`
+The Linux kernel userfault support works on ``/dev/shm`` memory and on ``hugetlbfs``
+(although the kernel doesn't provide an equivalent to ``madvise(MADV_DONTNEED)``
 for hugetlbfs which may be a problem in some configurations).
 
 The vhost-user code in QEMU supports clients that have Postcopy support,
-and the `vhost-user-bridge` (in `tests/`) and the DPDK package have changes
+and the ``vhost-user-bridge`` (in ``tests/``) and the DPDK package have changes
 to support postcopy.
 
 The client needs to open a userfaultfd and register the areas

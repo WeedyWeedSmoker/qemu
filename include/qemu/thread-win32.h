@@ -5,6 +5,10 @@
 
 struct QemuMutex {
     SRWLOCK lock;
+#ifdef CONFIG_DEBUG_MUTEX
+    const char *file;
+    int line;
+#endif
     bool initialized;
 };
 
@@ -13,11 +17,6 @@ struct QemuRecMutex {
     CRITICAL_SECTION lock;
     bool initialized;
 };
-
-void qemu_rec_mutex_destroy(QemuRecMutex *mutex);
-void qemu_rec_mutex_lock(QemuRecMutex *mutex);
-int qemu_rec_mutex_trylock(QemuRecMutex *mutex);
-void qemu_rec_mutex_unlock(QemuRecMutex *mutex);
 
 struct QemuCond {
     CONDITION_VARIABLE var;
@@ -42,6 +41,6 @@ struct QemuThread {
 };
 
 /* Only valid for joinable threads.  */
-HANDLE qemu_thread_get_handle(QemuThread *thread);
+HANDLE qemu_thread_get_handle(struct QemuThread *thread);
 
 #endif

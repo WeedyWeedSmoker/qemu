@@ -39,23 +39,43 @@ struct BlockJobDriver {
     JobDriver job_driver;
 
     /*
+     * I/O API functions. These functions are thread-safe.
+     *
+     * See include/block/block-io.h for more information about
+     * the I/O API.
+     */
+
+    /*
+     * Returns whether the job has pending requests for the child or will
+     * submit new requests before the next pause point. This callback is polled
+     * in the context of draining a job node after requesting that the job be
+     * paused, until all activity on the child has stopped.
+     */
+    bool (*drained_poll)(BlockJob *job);
+
+    /*
+     * Global state (GS) API. These functions run under the BQL.
+     *
+     * See include/block/block-global-state.h for more information about
+     * the GS API.
+     */
+
+    /*
      * If the callback is not NULL, it will be invoked before the job is
      * resumed in a new AioContext.  This is the place to move any resources
      * besides job->blk to the new AioContext.
      */
     void (*attached_aio_context)(BlockJob *job, AioContext *new_context);
 
-    /*
-     * If the callback is not NULL, it will be invoked when the job has to be
-     * synchronously cancelled or completed; it should drain BlockDriverStates
-     * as required to ensure progress.
-     *
-     * Block jobs must use the default implementation for job_driver.drain,
-     * which will in turn call this callback after doing generic block job
-     * stuff.
-     */
-    void (*drain)(BlockJob *job);
+    void (*set_speed)(BlockJob *job, int64_t speed);
 };
+
+/*
+ * Global state (GS) API. These functions run under the BQL.
+ *
+ * See include/block/block-global-state.h for more information about
+ * the GS API.
+ */
 
 /**
  * block_job_create:
@@ -99,13 +119,12 @@ void block_job_free(Job *job);
  */
 void block_job_user_resume(Job *job);
 
-/**
- * block_job_drain:
- * Callback to be used for JobDriver.drain in all block jobs. Drains the main
- * block node associated with the block jobs and calls BlockJobDriver.drain for
- * job-specific actions.
+/*
+ * I/O API functions. These functions are thread-safe.
+ *
+ * See include/block/block-io.h for more information about
+ * the I/O API.
  */
-void block_job_drain(Job *job);
 
 /**
  * block_job_ratelimit_get_delay:

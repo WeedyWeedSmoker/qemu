@@ -25,7 +25,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "tap_int.h"
-#include "sysemu/sysemu.h"
+#include "qemu/ctype.h"
 #include "qemu/cutils.h"
 
 #include <sys/ethernet.h>
@@ -198,7 +198,7 @@ int tap_open(char *ifname, int ifname_size, int *vnet_hdr,
             return -1;
         }
     }
-    fcntl(fd, F_SETFL, O_NONBLOCK);
+    g_unix_set_fd_nonblocking(fd, true, NULL);
     return fd;
 }
 
@@ -206,7 +206,7 @@ void tap_set_sndbuf(int fd, const NetdevTapOptions *tap, Error **errp)
 {
 }
 
-int tap_probe_vnet_hdr(int fd)
+int tap_probe_vnet_hdr(int fd, Error **errp)
 {
     return 0;
 }
@@ -251,6 +251,11 @@ int tap_fd_disable(int fd)
 }
 
 int tap_fd_get_ifname(int fd, char *ifname)
+{
+    return -1;
+}
+
+int tap_fd_set_steering_ebpf(int fd, int prog_fd)
 {
     return -1;
 }
